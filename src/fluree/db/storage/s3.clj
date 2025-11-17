@@ -44,9 +44,9 @@
         session-token (or (System/getenv "AWS_SESSION_TOKEN")
                           (System/getProperty "aws.sessionToken"))]
     (when (and access-key secret-key)
-      (cond-> {:access-key access-key
-               :secret-key secret-key}
-        session-token (assoc :session-token session-token)))))
+      (cond-> {:access-key (str/trim access-key)
+               :secret-key (str/trim secret-key)}
+        session-token (assoc :session-token (str/trim session-token))))))
 
 (defn hmac-sha256
   "Generate HMAC-SHA256 signature"
@@ -140,7 +140,7 @@
 
 (defn sign-request
   "Sign an S3 request using AWS Signature V4"
-  [{:keys [method path headers payload region bucket credentials query-params]}]
+  [{:keys [method path headers payload region bucket credentials query-params endpoint]}]
   (let [{:keys [access-key secret-key session-token]} credentials
         now (Instant/now)
         amz-date (.format amz-date-formatter now)
@@ -152,7 +152,20 @@
                        (sha256-hex ""))
 
         ;; Add required headers
-        host-header (str bucket ".s3." region ".amazonaws.com")
+        ;; For custom endpoints (path-style), extract host from endpoint URL
+        ;; For AWS S3 (virtual-hosted), use bucket.s3.region.amazonaws.com
+        host-header (if endpoint
+                      ;; Extract host from endpoint URL (remove protocol)
+                      (-> endpoint
+                          (str/replace #"^https?://" "")
+                          (str/split #"/")
+                          first)
+                      ;; AWS S3 virtual-hosted style
+                      (str bucket ".s3." region ".amazonaws.com"))
+        ;; For path-style URLs, canonical URI must include bucket
+        canonical-path (if endpoint
+                         (str "/" bucket "/" path)
+                         path)
         ;; Remove restricted headers that Java 11 HTTP client sets automatically
         headers-cleaned (dissoc headers "host" "Host" "content-length" "Content-Length")
         headers* (merge headers-cleaned
@@ -166,20 +179,26 @@
         ;; Create canonical request
         canonical-req (create-canonical-request
                        method
-                       (canonical-uri path)
+                       (canonical-uri canonical-path)
                        (canonical-query-string query-params)
                        headers-for-signing
                        payload-hash)
 
         ;; Create string to sign
-        credential-scope (str date-stamp "/" region "/" aws-service "/" aws4-request)
+        ;; GCS requires 'auto' as the region in signatures
+        ;; Detect GCS by checking if endpoint contains 'googleapis.com'
+        ;; Other S3-compatible services typically use the actual region
+        signature-region (if (and endpoint (str/includes? endpoint "googleapis.com"))
+                           "auto"
+                           region)
+        credential-scope (str date-stamp "/" signature-region "/" aws-service "/" aws4-request)
         string-to-sign (create-string-to-sign
                         amz-date
                         credential-scope
                         (sha256-hex canonical-req))
 
         ;; Calculate signature
-        signing-key (get-signature-key secret-key date-stamp region aws-service)
+        signing-key (get-signature-key secret-key date-stamp signature-region aws-service)
         signature (-> (hmac-sha256 signing-key string-to-sign)
                       (alphabase/base-to-base :bytes :hex))
 
@@ -189,18 +208,40 @@
                            "SignedHeaders=" (signed-headers headers-for-signing) ", "
                            "Signature=" signature)]
 
+    ;; Debug logging for signature issues
+    (when endpoint
+      (log/debug "S3 signature calculation"
+                 {:endpoint endpoint
+                  :host host-header
+                  :canonical-path canonical-path
+                  :signature-region signature-region
+                  :credential-scope credential-scope
+                  :access-key access-key
+                  :secret-key-length (count secret-key)
+                  :canonical-request canonical-req
+                  :string-to-sign string-to-sign
+                  :signature signature}))
+    
     (assoc headers* "authorization" authorization)))
 
 (defn build-s3-url
-  "Build the S3 REST API URL"
-  [bucket region path]
-  (str "https://" bucket ".s3." region ".amazonaws.com/" path))
+  "Build the S3 REST API URL.
+   For AWS S3, uses virtual-hosted-style URLs: https://bucket.s3.region.amazonaws.com/path
+   For custom endpoints (MinIO, GCS, etc.), uses path-style URLs: https://endpoint/bucket/path"
+  ([bucket region path]
+   (build-s3-url bucket region path nil))
+  ([bucket region path endpoint]
+   (if endpoint
+     ;; Path-style URL for S3-compatible services
+     (str endpoint "/" bucket "/" path)
+     ;; Virtual-hosted-style URL for AWS S3
+     (str "https://" bucket ".s3." region ".amazonaws.com/" path))))
 
 (declare with-retries parse-list-objects-response)
 
 (defn s3-request
   "Make an S3 REST API request"
-  [{:keys [method bucket region path headers body credentials query-params request-timeout]
+  [{:keys [method bucket region path headers body credentials query-params request-timeout endpoint]
     :or   {method  "GET"
            headers {}}}]
   (go-try
@@ -208,7 +249,7 @@
           ;; Encode path segments for both URL and signature to match S3's encoding
           encoded-path              (encode-s3-path path)
           query-string              (canonical-query-string query-params)
-          url                       (str (build-s3-url bucket region encoded-path)
+          url                       (str (build-s3-url bucket region encoded-path endpoint)
                                          (when query-string (str "?" query-string)))
           headers-with-content-type (if (and (= method "PUT") body)
                                       (assoc headers "Content-Type" "application/octet-stream")
@@ -221,6 +262,7 @@
                                       :region       region
                                       :bucket       bucket
                                       :credentials  credentials
+                                      :endpoint     endpoint
                                       :query-params query-params})
 
           ;; Use xhttp for the actual request
@@ -280,7 +322,7 @@
   ([client path]
    (read-s3-data client path {}))
   ([client path headers]
-   (let [{:keys [credentials bucket region prefix read-timeout-ms max-retries
+   (let [{:keys [credentials bucket region prefix endpoint read-timeout-ms max-retries
                  retry-base-delay-ms retry-max-delay-ms]}
          client
 
@@ -295,6 +337,7 @@
                                         :region          region
                                         :path            path
                                         :credentials     credentials
+                                        :endpoint        endpoint
                                         :request-timeout read-timeout-ms}
                                  (seq headers) (assoc :headers headers))]
                        (s3-request req)))]
@@ -313,7 +356,7 @@
   ([client path data]
    (write-s3-data client path data {}))
   ([client path data headers]
-   (let [{:keys [credentials bucket region prefix write-timeout-ms max-retries
+   (let [{:keys [credentials bucket region prefix endpoint write-timeout-ms max-retries
                  retry-base-delay-ms retry-max-delay-ms]}
          client
 
@@ -329,6 +372,7 @@
                                         :path            path
                                         :body            data
                                         :credentials     credentials
+                                        :endpoint        endpoint
                                         :request-timeout write-timeout-ms}
                                  (seq headers) (assoc :headers headers))]
                        (s3-request req)))]
@@ -344,7 +388,7 @@
   ([client path]
    (s3-list* client path nil))
   ([client path continuation-token]
-   (let [{:keys [credentials bucket region prefix list-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
+   (let [{:keys [credentials bucket region prefix endpoint list-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
          ch (async/promise-chan)
          full-path (str prefix path)]
      (go
@@ -357,6 +401,7 @@
                                                               :region region
                                                               :path ""
                                                               :credentials credentials
+                                                              :endpoint endpoint
                                                               :query-params query-params
                                                               :request-timeout list-timeout-ms}))
                               {:max-retries max-retries
@@ -389,6 +434,8 @@
   (storage/build-fluree-address identifier method-name path))
 
 (defrecord S3Store [identifier credentials bucket region prefix
+                   ;; S3-compatible endpoint (nil for AWS S3)
+                    endpoint
                    ;; timeouts (ms)
                     read-timeout-ms
                     write-timeout-ms
@@ -587,7 +634,18 @@
     out))
 
 (defn open
-  "Open an S3 store using direct HTTP implementation"
+  "Open an S3 store using direct HTTP implementation.
+   
+   Parameters:
+   - bucket: S3 bucket name
+   - prefix: Optional prefix for all keys (e.g., 'myapp/data/')
+   - endpoint-override: Optional custom endpoint for S3-compatible storage
+                        (e.g., 'https://storage.googleapis.com' for GCS,
+                              'http://localhost:9000' for MinIO)
+                        If nil, uses AWS S3 endpoints
+   - opts: Map of optional configuration:
+     - read-timeout-ms, write-timeout-ms, list-timeout-ms: Request timeouts
+     - max-retries, retry-base-delay-ms, retry-max-delay-ms: Retry policy"
   ([bucket prefix]
    (open nil bucket prefix))
   ([identifier bucket prefix]
@@ -615,9 +673,13 @@
        (throw (ex-info "AWS credentials not found"
                        {:error :s3/missing-credentials
                         :hint "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"})))
-     ;; Note: endpoint-override can be handled via with-redefs of build-s3-url in tests
      (when endpoint-override
-       (log/warn "endpoint-override provided - can be handled via with-redefs of build-s3-url in tests"))
+       (log/info "Using custom S3-compatible endpoint:" endpoint-override)
+       (when (str/includes? endpoint-override "googleapis.com")
+         (log/info "Google Cloud Storage detected - using 'auto' region for signatures"
+                   {:access-key-prefix (subs (:access-key credentials) 0 (min 8 (count (:access-key credentials))))
+                    :hint "Verify HMAC keys are correct in GCS Console > Settings > Interoperability"})))
      (->S3Store identifier credentials bucket region normalized-prefix
+                endpoint-override
                 read-timeout-ms* write-timeout-ms* list-timeout-ms*
                 max-retries* retry-base-delay-ms* retry-max-delay-ms*))))
