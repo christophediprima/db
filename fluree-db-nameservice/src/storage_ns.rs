@@ -331,12 +331,28 @@ where
         let main_key = self.ns_key(ledger_name, branch);
         let index_key = self.index_key(ledger_name, branch);
 
-        // Read main record
-        let main_file: Option<NsFileV2> = self.read_json(&main_key).await?;
-
-        let Some(main) = main_file else {
-            return Ok(None);
+        // Read the main record bytes once.
+        let main_bytes = match self.storage.read_bytes(&main_key).await {
+            Ok(bytes) => bytes,
+            Err(CoreError::NotFound(_)) => return Ok(None),
+            Err(e) => {
+                return Err(NameServiceError::storage(format!(
+                    "Failed to read {main_key}: {e}"
+                )))
+            }
         };
+
+        // Graph-source records share the `ns@v2/{name}/{branch}.json` key space with
+        // ledger records but use a different schema with no `f:ledger` field. Report
+        // them as "not a ledger" (Ok(None)) so single-alias resolution yields a clean
+        // not-found and callers can fall back to graph-source resolution — instead of
+        // failing to deserialize NsFileV2 with a "missing field `f:ledger`" error.
+        // Mirrors the type-aware `lookup_any`.
+        if Self::is_graph_source_from_bytes(&main_bytes) {
+            return Ok(None);
+        }
+
+        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
@@ -2288,5 +2304,41 @@ mod tests {
             "status_v should be incremented on retract"
         );
         assert_eq!(after_retract.payload.state, "retracted");
+    }
+
+    /// Regression (storage backend twin of the file-backend test): a graph-source
+    /// record must surface from `lookup` as a clean not-found (Ok(None)) rather
+    /// than a "missing field `f:ledger`" deserialization error, so single-alias
+    /// query/`use` resolution can fall back to graph-source resolution.
+    #[tokio::test]
+    async fn test_storage_ns_lookup_skips_graph_source_record() {
+        use crate::{GraphSourceLookup, GraphSourcePublisher, GraphSourceType, NsLookupResult};
+        let ns = make_storage_ns();
+
+        publish_commit(&ns, "realdb:main", 1, &dummy_cid("commit-1")).await;
+        ns.publish_graph_source(
+            "gs",
+            "main",
+            GraphSourceType::Iceberg,
+            r#"{"catalog":"https://example.invalid","table":"ns.t"}"#,
+            &["realdb:main".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let result = ns.lookup("gs:main").await;
+        assert!(
+            matches!(result, Ok(None)),
+            "lookup of a graph-source alias should be Ok(None), got {result:?}"
+        );
+        assert!(ns.lookup("realdb:main").await.unwrap().is_some());
+        assert!(matches!(
+            ns.lookup_any("gs:main").await.unwrap(),
+            NsLookupResult::GraphSource(_)
+        ));
+        assert!(matches!(
+            ns.lookup_any("realdb:main").await.unwrap(),
+            NsLookupResult::Ledger(_)
+        ));
     }
 }

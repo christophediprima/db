@@ -15,6 +15,18 @@ pub async fn run(ledger: &str, dirs: &FlureeDir) -> CliResult<()> {
         return Ok(());
     }
 
+    // Check if it's a registered graph source (Iceberg/R2RML, BM25, vector, …)
+    if fluree
+        .nameservice()
+        .lookup_graph_source(&ledger_id)
+        .await?
+        .is_some()
+    {
+        config::write_active_ledger(dirs.data_dir(), ledger)?;
+        println!("Now using graph source '{ledger}'");
+        return Ok(());
+    }
+
     // Check if it's a tracked ledger
     let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     if store.get_tracked(ledger).is_some() || store.get_tracked(&ledger_id).is_some() {

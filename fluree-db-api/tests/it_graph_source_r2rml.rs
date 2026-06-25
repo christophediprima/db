@@ -1599,6 +1599,72 @@ async fn integration_create_r2rml_graph_source_with_mapping() {
     );
 }
 
+/// Regression for the Iceberg/R2RML graph-source alias-resolution bug
+/// (`Nameservice error: Serialization error: missing field f:ledger`).
+///
+/// Registering a graph source and then resolving it by alias through the same
+/// path the HTTP/CLI query handler uses (nameservice `lookup` / `db()` /
+/// `resolve_graph_source`) must NOT fail to deserialize the ledger `NsFileV2`
+/// record. This MUST use a file-backed nameservice: the in-memory backend keeps
+/// graph sources in a separate map and never deserializes the on-disk record,
+/// so it cannot reproduce the failure — which is exactly why the shipped tests
+/// (all `build_memory()`) missed it.
+#[tokio::test]
+async fn regression_graph_source_alias_resolves_on_file_backend() {
+    use fluree_db_api::R2rmlCreateConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("file-backed Fluree should build");
+
+    // Register an Iceberg/R2RML graph source. The catalog URI is bogus, but the
+    // bug fires during alias resolution, before any catalog call.
+    let config =
+        R2rmlCreateConfig::new("gs", "https://example.invalid", "ns.t", AIRLINE_MAPPING_TTL)
+            .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("graph source registration should succeed");
+
+    // 1. Nameservice lookup of the alias is a clean not-found, not a
+    //    Serialization error ("missing field `f:ledger`").
+    let looked_up = fluree.nameservice().lookup("gs:main").await;
+    assert!(
+        matches!(looked_up, Ok(None)),
+        "lookup(gs:main) should be Ok(None) for a graph-source alias, got {looked_up:?}"
+    );
+
+    // 2. db() (the single-target query entrypoint) reports a clean NotFound —
+    //    never a 500/Serialization error mentioning `f:ledger`.
+    match fluree.db("gs:main").await {
+        Ok(_) => panic!("db(gs:main) must not resolve a graph source as a ledger"),
+        Err(e) => {
+            assert!(
+                e.is_not_found(),
+                "db(gs:main) should be NotFound, got: {e:?}"
+            );
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("f:ledger") && !msg.to_lowercase().contains("serializ"),
+                "db(gs:main) must not be a serialization failure: {msg}"
+            );
+        }
+    }
+
+    // 3. The graph-source-aware resolver (used by the server/CLI single-target
+    //    query path) resolves the alias to a graph-source view.
+    let resolved = fluree
+        .resolve_graph_source("gs:main")
+        .await
+        .expect("resolve_graph_source should not error");
+    assert!(
+        resolved.is_some(),
+        "resolve_graph_source(gs:main) should resolve the registered graph source"
+    );
+}
+
 // =============================================================================
 // query_graph_source API Tests (GraphSourcePublisher impl)
 // =============================================================================

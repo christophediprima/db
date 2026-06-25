@@ -276,15 +276,30 @@ impl FileNameService {
 
     /// Load and merge main record with index file
     async fn load_record(&self, ledger_name: &str, branch: &str) -> Result<Option<NsRecord>> {
+        use fluree_db_core::StorageRead;
         let main_address = Self::ns_address(ledger_name, branch);
         let index_address = Self::index_address(ledger_name, branch);
 
-        // Read main record
-        let main_file: Option<NsFileV2> = self.read_json_from_address(&main_address).await?;
-
-        let Some(main) = main_file else {
-            return Ok(None);
+        // Read the main record bytes once.
+        let main_bytes = match self.storage.read_bytes(&main_address).await {
+            Ok(bytes) => bytes,
+            Err(fluree_db_core::Error::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(NameServiceError::from(e)),
         };
+
+        // Graph-source records share the `ns@v2/{name}/{branch}.json` address space
+        // with ledger records but use a different schema with no `f:ledger` field.
+        // Report them as "not a ledger" (Ok(None)) so single-alias resolution
+        // (`lookup` -> `LedgerState::load`) yields a clean not-found and callers can
+        // fall back to graph-source resolution — instead of failing to deserialize
+        // NsFileV2 with a "missing field `f:ledger`" error. This mirrors the
+        // type-aware `lookup_any` and is the single guard shared by all read paths
+        // (`lookup`, `list_branches`, `all_records`).
+        if Self::is_graph_source_from_bytes(&main_bytes) {
+            return Ok(None);
+        }
+
+        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json_from_address(&index_address).await?;
@@ -350,6 +365,16 @@ impl FileNameService {
         // Parse just enough to check @type
         let parsed: serde_json::Value = serde_json::from_str(&content)?;
         Ok(Self::is_graph_source_from_json(&parsed))
+    }
+
+    /// Check if raw JSON bytes represent a graph source record (exact match).
+    /// Unparseable bytes are treated as "not a graph source" so the caller can
+    /// surface the underlying deserialization error for the concrete record type.
+    fn is_graph_source_from_bytes(bytes: &[u8]) -> bool {
+        match serde_json::from_slice::<serde_json::Value>(bytes) {
+            Ok(parsed) => Self::is_graph_source_from_json(&parsed),
+            Err(_) => false,
+        }
     }
 
     /// Check if parsed JSON represents a graph source record (exact match).
@@ -449,10 +474,7 @@ impl crate::NameServiceLookup for FileNameService {
                 .trim_end_matches(".json")
                 .to_string();
 
-            if self.is_graph_source_record(ledger_name, &branch).await? {
-                continue;
-            }
-
+            // Graph-source records are skipped by `load_record` (returns Ok(None)).
             if let Ok(Some(record)) = self.load_record(ledger_name, &branch).await {
                 if !record.retracted {
                     records.push(record);
@@ -480,10 +502,7 @@ impl crate::NameServiceLookup for FileNameService {
                 continue;
             }
 
-            if self.is_graph_source_record(&parent, &file_stem).await? {
-                continue;
-            }
-
+            // Graph-source records are skipped by `load_record` (returns Ok(None)).
             if let Ok(Some(record)) = self.load_record(&parent, &file_stem).await {
                 records.push(record);
             }
@@ -2539,5 +2558,56 @@ mod tests {
         assert_eq!(record.source_branch.as_deref(), Some("main"));
         assert_eq!(record.commit_head_id, Some(cid));
         assert_eq!(record.commit_t, 2);
+    }
+
+    /// Regression: a graph-source record shares the `ns@v2/{name}/{branch}.json`
+    /// key space with ledger records but uses a different schema (no `f:ledger`).
+    /// `lookup` must report it as a clean not-found (Ok(None)) instead of failing
+    /// to deserialize `NsFileV2` ("missing field `f:ledger`"), so the query/`use`
+    /// path can fall back to graph-source resolution.
+    #[tokio::test]
+    async fn test_file_ns_lookup_skips_graph_source_record() {
+        use crate::{GraphSourceLookup, GraphSourcePublisher, GraphSourceType, NsLookupResult};
+        let (_temp, ns) = setup().await;
+
+        ns.publish_commit("realdb:main", 1, &test_cid("commit-1"))
+            .await
+            .unwrap();
+        ns.publish_graph_source(
+            "gs",
+            "main",
+            GraphSourceType::Iceberg,
+            r#"{"catalog":"https://example.invalid","table":"ns.t"}"#,
+            &["realdb:main".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // The bug: lookup of a graph-source alias used to fail to deserialize the
+        // ledger NsFileV2. It must now be a clean not-found.
+        let result = ns.lookup("gs:main").await;
+        assert!(
+            matches!(result, Ok(None)),
+            "lookup of a graph-source alias should be Ok(None), got {result:?}"
+        );
+
+        // The regular ledger still resolves.
+        assert!(ns.lookup("realdb:main").await.unwrap().is_some());
+
+        // The type-aware resolver still classifies each correctly.
+        assert!(matches!(
+            ns.lookup_any("gs:main").await.unwrap(),
+            NsLookupResult::GraphSource(_)
+        ));
+        assert!(matches!(
+            ns.lookup_any("realdb:main").await.unwrap(),
+            NsLookupResult::Ledger(_)
+        ));
+
+        // list_branches / all_records keep excluding graph-source records.
+        assert!(ns.list_branches("gs").await.unwrap().is_empty());
+        let all = ns.all_records().await.unwrap();
+        assert_eq!(all.len(), 1, "all_records should list only the ledger");
+        assert_eq!(all[0].ledger_id, "realdb:main");
     }
 }

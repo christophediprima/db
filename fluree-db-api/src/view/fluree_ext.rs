@@ -592,28 +592,41 @@ impl Fluree {
     pub async fn load_graph_db_or_graph_source(&self, ledger_id: &str) -> Result<GraphDb> {
         match self.load_graph_db(ledger_id).await {
             Ok(db) => Ok(db),
-            Err(ref e) if e.is_not_found() => {
-                let gs_id = fluree_db_core::normalize_ledger_id(ledger_id)
-                    .unwrap_or_else(|_| ledger_id.to_string());
-
-                let _record = self
-                    .nameservice()
-                    .lookup_graph_source(&gs_id)
-                    .await
-                    .map_err(|e| ApiError::internal(e.to_string()))?
-                    .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
-
-                let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
-                let state = fluree_db_ledger::LedgerState::new(
-                    snapshot,
-                    fluree_db_novelty::Novelty::new(0),
-                );
-                let mut db = GraphDb::from_ledger_state(&state);
-                db.graph_source_id = Some(gs_id.into());
-                Ok(db)
-            }
+            Err(ref e) if e.is_not_found() => self
+                .resolve_graph_source(ledger_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(ledger_id.to_string())),
             Err(e) => Err(e),
         }
+    }
+
+    /// Resolve `ledger_id` as a registered graph source (Iceberg/R2RML, BM25,
+    /// vector, …), returning a minimal genesis view tagged with the graph
+    /// source id. Returns `Ok(None)` when no graph source is registered under
+    /// the alias.
+    ///
+    /// The `graph_source_id` tag causes query execution to auto-wrap patterns
+    /// in `GRAPH <gs_id> { ... }` so the configured provider resolves them.
+    pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
+        let gs_id = fluree_db_core::normalize_ledger_id(ledger_id)
+            .unwrap_or_else(|_| ledger_id.to_string());
+
+        if self
+            .nameservice()
+            .lookup_graph_source(&gs_id)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
+        let state =
+            fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
+        let mut db = GraphDb::from_ledger_state(&state);
+        db.graph_source_id = Some(gs_id.into());
+        Ok(Some(db))
     }
 }
 

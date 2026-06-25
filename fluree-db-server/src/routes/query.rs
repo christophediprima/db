@@ -1910,6 +1910,47 @@ fn delimited_response(bytes: Vec<u8>, format: DelimitedFormat) -> Response {
     ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
 }
 
+/// Query input for a single-target graph-source query.
+#[cfg(feature = "iceberg")]
+enum GraphSourceQueryInput<'a> {
+    JsonLd(&'a JsonValue),
+    Sparql(&'a str),
+}
+
+/// Execute a query against an already-resolved graph-source view via the
+/// R2RML-aware path, returning formatted JSON.
+///
+/// `view` must carry a `graph_source_id` (see [`Fluree::resolve_graph_source`]);
+/// `with_r2rml()` attaches the Iceberg/R2RML provider and the engine wraps the
+/// patterns in `GRAPH <gs> { ... }` so the provider resolves them. Graph-source
+/// queries support JSON output only — delimited / XML formats are rejected by
+/// the caller.
+#[cfg(feature = "iceberg")]
+async fn run_graph_source_view_query(
+    state: &AppState,
+    view: &GraphDb,
+    input: GraphSourceQueryInput<'_>,
+    format: Option<fluree_db_api::FormatterConfig>,
+    span: &tracing::Span,
+) -> Result<JsonValue> {
+    let builder = view
+        .query(state.fluree.as_ref())
+        .with_r2rml()
+        .execution_options(query_execution_options(state));
+    let builder = match input {
+        GraphSourceQueryInput::JsonLd(json) => builder.jsonld(json),
+        GraphSourceQueryInput::Sparql(sparql) => builder.sparql(sparql),
+    };
+    let builder = match format {
+        Some(cfg) => builder.format(cfg),
+        None => builder,
+    };
+    builder.execute_formatted().await.map_err(|e| {
+        set_span_error_code(span, "error:QueryFailed");
+        ServerError::Api(e)
+    })
+}
+
 async fn execute_query(
     state: &AppState,
     ledger_id: &str,
@@ -1978,7 +2019,36 @@ async fn execute_query(
     }
 
     // Shared storage mode: use load_ledger_for_query with freshness checking
-    let ledger = load_ledger_for_query(state, ledger_id, &span).await?;
+    let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            // A graph-source alias (Iceberg/R2RML) is not a ledger. After the
+            // nameservice fix it surfaces here as a clean not-found; resolve it as
+            // a graph source and run via the R2RML-aware view path.
+            #[cfg(feature = "iceberg")]
+            if matches!(&e, ServerError::Api(api) if api.is_not_found()) {
+                if let Some(view) = state.fluree.resolve_graph_source(ledger_id).await? {
+                    if let Some(fmt) = delimited {
+                        return Err(ServerError::not_acceptable(format!(
+                            "{} format not supported for graph source queries",
+                            fmt.name().to_uppercase()
+                        )));
+                    }
+                    let result = run_graph_source_view_query(
+                        state,
+                        &view,
+                        GraphSourceQueryInput::JsonLd(query_json),
+                        None,
+                        &span,
+                    )
+                    .await?;
+                    tracing::info!(status = "success", graph_source = true);
+                    return Ok((HeaderMap::new(), Json(result)).into_response());
+                }
+            }
+            return Err(e);
+        }
+    };
     let graph = GraphDb::from_ledger_state(&ledger);
     let fluree = &state.fluree;
 
@@ -2367,6 +2437,34 @@ async fn execute_sparql_ledger(
         // are negotiated separately on their own branches and ignore this.
         let (json_fmt_config, json_content_type) =
             sparql_json_response_format(parsed.ast.as_ref(), headers);
+
+        // Single-target graph source (Iceberg/R2RML) with no dataset clause:
+        // resolve the alias as a graph source and run via the R2RML-aware path.
+        // (A SPARQL FROM/FROM NAMED clause is handled by the dataset branch below.)
+        #[cfg(feature = "iceberg")]
+        if !has_dataset_clause {
+            if let Some(view) = state.fluree.resolve_graph_source(ledger_id).await? {
+                if wants_sparql_xml || wants_rdf_xml || delimited.is_some() {
+                    return Err(ServerError::not_acceptable(
+                        "Only JSON output is supported for graph source queries".to_string(),
+                    ));
+                }
+                let result = run_graph_source_view_query(
+                    state,
+                    &view,
+                    GraphSourceQueryInput::Sparql(sparql),
+                    Some(json_fmt_config.clone()),
+                    &span,
+                )
+                .await?;
+                tracing::info!(status = "success", graph_source = true);
+                return Ok((
+                    [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                    Json(result),
+                )
+                    .into_response());
+            }
+        }
 
         // In proxy mode, use the unified Fluree method (returns pre-formatted JSON)
         if state.config.is_proxy_storage_mode() && !has_dataset_clause {
