@@ -70,6 +70,8 @@ mod inline_ontology;
 mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
+#[cfg(feature = "iceberg")]
+pub mod materialize_worker;
 mod merge;
 mod merge_preview;
 pub mod nameservice_query;
@@ -204,14 +206,20 @@ pub use graph_source::{
     sample_column_values, sample_iceberg_rows, BrowseDepth, CatalogBrowse, CatalogMode, ColumnInfo,
     ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest,
     GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig, IcebergCreateResult,
-    PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode,
-    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StructuredR2rmlMapping,
+    MaterializeResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput,
+    RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StructuredR2rmlMapping,
     SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
     ValidateR2rmlResponse,
 };
 
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
+};
+
+#[cfg(feature = "iceberg")]
+pub use materialize_worker::{
+    MaterializeTrackingWorker, MaterializeWorkerConfig, MaterializeWorkerHandle,
+    MaterializeWorkerStats,
 };
 
 #[cfg(feature = "vector")]
