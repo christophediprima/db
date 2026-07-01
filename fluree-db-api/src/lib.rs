@@ -212,6 +212,9 @@ pub use graph_source::{
     ValidateR2rmlResponse,
 };
 
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::DeleteConvention;
+
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
