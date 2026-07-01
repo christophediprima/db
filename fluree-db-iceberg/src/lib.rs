@@ -65,7 +65,9 @@ pub mod scan;
 pub mod stats;
 
 // Re-export commonly used types
-pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
+pub use config::{
+    CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, TableConfig,
+};
 pub use config_value::ConfigValue;
 pub use error::{IcebergError, Result};
 
