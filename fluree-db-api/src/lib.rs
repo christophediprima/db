@@ -207,9 +207,9 @@ pub use graph_source::{
     ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest,
     GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig, IcebergCreateResult,
     MaterializeResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput,
-    RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StructuredR2rmlMapping,
-    SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
-    ValidateR2rmlResponse,
+    RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
+    StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride, TablePreview,
+    TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 #[cfg(feature = "iceberg")]

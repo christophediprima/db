@@ -2856,6 +2856,8 @@ mod tests {
             table: TableConfig::Identifier("ns.t".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
 
         let stored = cfg.to_json().unwrap();
@@ -2928,6 +2930,13 @@ mod tests {
                 scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
                 audience: None,
             },
+            // Metadata-server auth carries no secret (tokens are fetched at
+            // runtime), so there is nothing to redact — but the canary below
+            // still requires it to be covered.
+            AuthConfig::GoogleMetadata {
+                scopes: None,
+                metadata_url: None,
+            },
         ];
 
         // Exhaustiveness canary — NO wildcard arm. A new AuthConfig variant
@@ -2937,7 +2946,8 @@ mod tests {
             match auth {
                 AuthConfig::None
                 | AuthConfig::Bearer { .. }
-                | AuthConfig::OAuth2ClientCredentials { .. } => {}
+                | AuthConfig::OAuth2ClientCredentials { .. }
+                | AuthConfig::GoogleMetadata { .. } => {}
             }
         }
 
@@ -2952,6 +2962,8 @@ mod tests {
                 table: TableConfig::Identifier("ns.t".to_string()),
                 io: IoConfig::default(),
                 mapping: None,
+                delete: None,
+                order_by: None,
             };
             let stored = cfg.to_json().unwrap();
             let redacted = redact_graph_source_config(&stored);
