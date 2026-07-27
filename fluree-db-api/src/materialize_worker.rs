@@ -14,10 +14,11 @@
 //! and polls only the jobs whose `next_due` has arrived, so jobs on different
 //! timers are independent.
 //!
-//! Unlike [`crate::bm25_worker`] (event-driven, single-threaded `Rc`/`RefCell`),
-//! this worker is **polling** and `Send`: it owns an `Arc<Fluree>` and shares its
-//! job set / stop flag / stats behind `Arc<Mutex<…>>`, so it spawns with a plain
-//! `tokio::spawn`. Iceberg emits no commit events, so polling is the only option.
+//! Unlike [`crate::bm25_worker`] (event-driven), this worker is **polling**:
+//! Iceberg emits no commit events, so a timer is the only option. Like it, this
+//! worker is `Send` — it owns an `Arc<Fluree>` and shares its job set / stop
+//! flag / stats behind `Arc<Mutex<…>>`, so it spawns with a plain
+//! `tokio::spawn`.
 //!
 //! Only available with the `iceberg` feature.
 

@@ -241,16 +241,12 @@ BM25 and vector indexes are created via the Rust API. See [BM25](bm25.md) and [V
 
 ### Updating Indexes
 
-BM25 indexes are **not** automatically updated when the source ledger changes. They must be explicitly synced:
+`fluree server` keeps BM25 indexes up to date automatically — see [Background Maintenance](#background-maintenance). Embedded and CLI users sync explicitly:
 
 ```rust
 // Incremental sync (detects changes since last watermark)
 let result = fluree.sync_bm25_index("products-search:main").await?;
-
-// Or use the Bm25MaintenanceWorker for automatic background syncing
 ```
-
-The `Bm25MaintenanceWorker` can be configured to watch for ledger commits and sync automatically.
 
 ### Deleting Indexes
 
@@ -439,10 +435,13 @@ println!("Index at t={}, ledger at t={}, stale: {}, lag: {}",
 
 ### Background Maintenance
 
-The `Bm25MaintenanceWorker` watches for source ledger commits and syncs indexes automatically:
-- Debounces rapid commits (configurable interval)
+`fluree server` spawns a `Bm25MaintenanceWorker` on every write node. It watches for source ledger commits and syncs the dependent indexes automatically:
+- Adopts every persisted **tracked** BM25 index at start-up (including ones created out of process by `fluree bm25 create`), and catches up any that are already stale. Opt an index out with `fluree bm25 create --no-track` / `POST /bm25/untrack`; `fluree bm25 list` shows the flag
+- Debounces rapid commits (100ms by default)
 - Bounded concurrency for concurrent sync operations
-- Registers/unregisters graph sources dynamically
+- Registers/unregisters indexes as they are created and retracted
+
+The event bus is in-process, so the worker only sees commits written by its own process — it belongs in the server, not in a CLI one-shot. Registration and status are exposed as `POST /v1/fluree/bm25/track|untrack` and `GET /v1/fluree/bm25/tracking`; see [BM25 Full-Text Search](bm25.md#background-maintenance-worker).
 
 ## Best Practices
 
