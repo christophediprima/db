@@ -2,6 +2,7 @@
 
 mod admin;
 pub(crate) mod admin_auth;
+mod bm25;
 mod commits;
 mod context;
 mod events;
@@ -96,7 +97,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/import-upload/:import_id/complete",
             post(import::complete_upload),
-        );
+        )
+        // BM25 index maintenance. Not writes to a ledger, but they mutate this
+        // node's maintenance worker, flip a persisted flag on the index record
+        // and trigger a sync — so they belong inside the admin bracket.
+        .route("/bm25/track", post(bm25::bm25_track))
+        .route("/bm25/untrack", post(bm25::bm25_untrack));
 
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_writes =
@@ -135,7 +141,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/export/*ledger", post(export::export_ledger_tail))
         // Status of a negotiated upload — reads this node's
         // `state.import_jobs` map (each node owns the jobs it minted).
-        .route("/import-upload/:import_id", get(import::import_status));
+        .route("/import-upload/:import_id", get(import::import_status))
+        // BM25 maintenance-worker status — reads this node's worker state.
+        .route("/bm25/tracking", get(bm25::bm25_tracking_status));
 
     // Read-only Iceberg catalog browse / metadata preview. POSTs (the inline
     // connection carries a secret in the body) but they mutate nothing and
