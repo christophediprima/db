@@ -18,9 +18,9 @@ A self-describing query envelope designed for LLM consumption: datatypes declare
 
 Fluree exposes Model Context Protocol in two distinct places:
 
-- **Server `/mcp` endpoint** — turns a running ledger into a tool an agent can call. Exposes `sparql_query` (results returned as Agent JSON, byte-budgeted) and `get_data_model` (schema/stats discovery). Off by default; enable with `--mcp-enabled` and protect it with `--mcp-auth-trusted-issuer`. Tune the Agent JSON budget and query timeout per the config reference.
+- **Server `/mcp` endpoint** — turns a running ledger into a tool an agent can call. Exposes `sparql_query` (SPARQL SELECT), `fql_query` (Fluree FQL/JSON-LD SELECT — the one that adds BM25 full-text search, which is FQL-only), and `get_data_model` (schema/stats discovery). Query tools return Agent JSON (byte-budgeted). Off by default; enable with `--mcp-enabled` and protect it with `--mcp-auth-trusted-issuer`. Tune the Agent JSON budget and query timeout per the config reference.
 
-  → [MCP endpoint configuration](../operations/configuration.md#mcp-endpoint)
+  → [Querying over MCP](../query/mcp.md) · [MCP endpoint configuration](../operations/configuration.md#mcp-endpoint)
 
 - **CLI `fluree mcp serve`** — a stdio MCP server for IDE agents, exposing the Fluree Memory tools (`memory_add`, `memory_recall`, `memory_update`, `memory_forget`, `memory_status`) plus `kg_query` for raw SPARQL over the memory graph.
 
@@ -50,6 +50,6 @@ A typical agent-over-Fluree stack:
 
 1. **Ingest** your domain into a ledger as RDF (optionally with [edge annotations](../concepts/edge-annotations.md) for provenance/confidence on each statement).
 2. **Index** it for [vector](../indexing-and-search/vector-search.md) and [BM25](../indexing-and-search/bm25.md) search.
-3. **Expose** the ledger to the agent via the [server `/mcp` endpoint](../operations/configuration.md#mcp-endpoint), so it can call `get_data_model` to learn the schema and `sparql_query` to retrieve — getting back [Agent JSON](../query/output-formats.md#agent-json-format) sized to its context budget.
+3. **Expose** the ledger to the agent via the [server `/mcp` endpoint](../query/mcp.md), so it can call `get_data_model` to learn the schema, then `sparql_query` or `fql_query` (the latter for BM25 full-text search) to retrieve — getting back [Agent JSON](../query/output-formats.md#agent-json-format) sized to its context budget.
 4. **Govern** access with [policy](../security/policy-in-queries.md) and prove provenance with [time travel](../concepts/time-travel.md) and [signed commits](../security/commit-signing.md).
 5. For the **coding-assistant** use case, layer [Fluree Memory](../memory/README.md) so the agent remembers decisions and constraints across sessions.

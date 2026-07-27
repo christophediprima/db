@@ -1186,6 +1186,7 @@ curl -X POST http://localhost:8090/v1/fluree/update \
 ## Related Documentation
 
 - [JSON-LD Query](jsonld-query.md): Fluree's native query language
+- [Querying over MCP](mcp.md): Running SPARQL (and FQL) through the server's `/mcp` agent endpoint
 - [Edge annotations](../concepts/edge-annotations.md): RDF 1.2 / SPARQL 1.2 edge metadata (annotation tail, `~` reifier, `rdf:reifies`)
 - [CONSTRUCT Queries](construct.md): Generating RDF graphs
 - [Datasets](datasets.md): Multi-graph queries

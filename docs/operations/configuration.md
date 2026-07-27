@@ -610,7 +610,9 @@ If no admin-specific issuers are configured, falls back to `--events-auth-truste
 
 ### MCP Endpoint
 
-Protect and tune the `/mcp` Model Context Protocol endpoint:
+Protect and tune the `/mcp` Model Context Protocol endpoint. It exposes three read-only
+tools — `get_data_model`, `sparql_query`, and `fql_query` (Fluree FQL/JSON-LD, the one that
+supports BM25 full-text search). See [Querying over MCP](../query/mcp.md) for how to use them.
 
 | Flag                         | Env Var                           | Default                |
 | ---------------------------- | --------------------------------- | ---------------------- |
@@ -620,12 +622,14 @@ Protect and tune the `/mcp` Model Context Protocol endpoint:
 | `--mcp-query-timeout-ms`     | `FLUREE_MCP_QUERY_TIMEOUT_MS`     | `300000` (5 minutes)   |
 
 `--mcp-agent-json-max-bytes` (config file: `[server.mcp] agent_json_max_bytes`) is the byte
-budget for the MCP `sparql_query` tool's Agent JSON result. Results larger than this are
-truncated and the envelope sets `hasMore: true`; an agent paginates by re-running with the
-returned `t`, an `ORDER BY`, and `OFFSET` advanced by the returned `rowCount`.
+budget for the Agent JSON result returned by the `sparql_query` and `fql_query` tools.
+Results larger than this are truncated and the envelope sets `hasMore: true`; the tool's
+`message` field explains how to paginate (`sparql_query`: re-run with the returned `t`, an
+`ORDER BY`, and `OFFSET` advanced by the returned `rowCount`; `fql_query`: narrow the query
+or page with `limit`/`offset`).
 
 `--mcp-query-timeout-ms` (config file: `[server.mcp] query_timeout_ms`) is the
-server-side timeout for MCP `sparql_query` execution. It uses the same
+server-side timeout for MCP `sparql_query` / `fql_query` execution. It uses the same
 cooperative cancellation mechanism as HTTP queries, but defaults lower because
 MCP tool calls are usually interactive. Set to `0` to disable the MCP timeout.
 This setting does not apply to `get_data_model`, which may perform schema/stat

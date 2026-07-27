@@ -295,6 +295,126 @@ async fn agent_json_rejects_non_select() {
     }
 }
 
+/// A SELECT-style FQL query over the same `ex:name` data returns the same Agent JSON
+/// envelope shape as `sparql_query` — this is the path the MCP `fql_query` tool drives,
+/// and (via `run_jsonld_subquery`) the same connection path the HTTP `/v1/fluree/query`
+/// route uses, so a BM25 `f:searchText` block would resolve here too.
+#[tokio::test]
+async fn fql_agent_json_envelope_shape() {
+    let (_tmp, state) = test_state().await;
+    create_ledger(&state, "test:fql").await;
+    insert(&state, "test:fql", rows_graph(3)).await;
+
+    // `fql_query` requires an identity (fail-closed), and an identity with no policy
+    // assignments is default-DENY (sees 0 rows). `default-allow: true` opts into the
+    // unrestricted default so this end-to-end test asserts real data flow; it also exercises
+    // `force_identity_opts` merging `identity` into a pre-existing `opts` object.
+    let query = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "test:fql",
+        "where": [{ "@id": "?s", "ex:name": "?name" }],
+        "select": ["?s", "?name"],
+        "opts": { "default-allow": true },
+    });
+
+    let svc = FlureeToolService::new(state.clone());
+    let env = svc
+        .execute_fql_agent_json(&query, Some("did:key:z6MkExample"), 32_768)
+        .await
+        .expect("fql query ok");
+
+    assert!(
+        env.get("schema").map(JsonValue::is_object).unwrap_or(false),
+        "schema should be an object: {env}"
+    );
+    let rows = env
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("rows array");
+    let row_count = env
+        .get("rowCount")
+        .and_then(JsonValue::as_u64)
+        .expect("rowCount");
+    assert_eq!(
+        row_count as usize,
+        rows.len(),
+        "rowCount matches rows length"
+    );
+    assert_eq!(row_count, 3, "all three rows returned");
+    assert_eq!(env.get("hasMore"), Some(&JsonValue::Bool(false)));
+}
+
+/// `fql_query` fails closed when the token resolves no identity. Unlike `sparql_query`, an
+/// FQL body can carry its own `opts.identity`, so running identity-less would let a caller
+/// read under any identity it names — the tool refuses instead.
+#[tokio::test]
+async fn fql_requires_authenticated_identity() {
+    let (_tmp, state) = test_state().await;
+    create_ledger(&state, "test:fqlident").await;
+    insert(&state, "test:fqlident", rows_graph(2)).await;
+
+    // A well-formed SELECT query (passes the select/from guards) that also tries to smuggle in
+    // its own identity — it must still be rejected because the caller presented no identity.
+    let query = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "test:fqlident",
+        "where": [{ "@id": "?s", "ex:name": "?name" }],
+        "select": ["?s", "?name"],
+        "opts": { "identity": "did:key:z6MkSomeoneElse" },
+    });
+
+    let svc = FlureeToolService::new(state.clone());
+    let err = svc
+        .execute_fql_agent_json(&query, None, 32_768)
+        .await
+        .expect_err("identity-less fql_query should be rejected");
+    assert!(
+        err.to_string().contains("identity"),
+        "error should explain the missing identity: {err}"
+    );
+}
+
+/// `fql_query` requires a SELECT-style clause and a `from` — node/graph FQL and a
+/// `from`-less body are rejected up front with a clear, learnable error.
+#[tokio::test]
+async fn fql_rejects_non_select_and_missing_from() {
+    let (_tmp, state) = test_state().await;
+    create_ledger(&state, "test:fqlkind").await;
+    insert(&state, "test:fqlkind", rows_graph(2)).await;
+
+    let svc = FlureeToolService::new(state.clone());
+
+    // Node/graph FQL (no select clause) has no solution-table shape.
+    let no_select = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "test:fqlkind",
+        "where": [{ "@id": "?s", "ex:name": "?name" }],
+    });
+    let err = svc
+        .execute_fql_agent_json(&no_select, None, 32_768)
+        .await
+        .expect_err("non-SELECT FQL should be rejected");
+    assert!(
+        err.to_string().contains("SELECT"),
+        "error should explain SELECT-only: {err}"
+    );
+
+    // A body without `from` cannot resolve a ledger.
+    let no_from = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?s", "ex:name": "?name" }],
+        "select": ["?s", "?name"],
+    });
+    let err = svc
+        .execute_fql_agent_json(&no_from, None, 32_768)
+        .await
+        .expect_err("from-less FQL should be rejected");
+    assert!(
+        err.to_string().contains("from"),
+        "error should explain the missing from clause: {err}"
+    );
+}
+
 /// `SELECT ?s ?name … ORDER BY ?s` with optional `LIMIT n OFFSET m`.
 fn paging_query(limit_offset: Option<(usize, usize)>) -> String {
     let base = "PREFIX ex: <http://example.org/>\n\

@@ -240,9 +240,17 @@ Fluree's query engine is optimized for:
 
 When you have multiple independent queries that should all see the same data — or that you'd otherwise issue as N concurrent HTTP requests — use the [Multi-query envelope](../api/multi-query.md). It runs N JSON-LD and/or SPARQL queries in parallel against a single resolved snapshot, with shared `@context` / `opts` defaults and per-alias result assembly.
 
+## Querying from an AI agent
+
+A running server can expose its ledgers to an AI agent over the built-in **`/mcp`**
+endpoint, which offers `get_data_model`, `sparql_query`, and `fql_query` (the last adds
+BM25 full-text search) as callable tools returning [Agent JSON](output-formats.md#agent-json-format).
+See [Querying over MCP](mcp.md).
+
 ## Related Documentation
 
 - [Concepts](../concepts/README.md): Core concepts including time travel, graph sources, and policy
+- [Querying over MCP](mcp.md): The server's `/mcp` agent query endpoint
 - [Transactions](../transactions/README.md): Writing data to Fluree
 - [Security and Policy](../security/README.md): Policy configuration and management
 - [Multi-query envelope](../api/multi-query.md): Bundle multiple queries against a shared snapshot

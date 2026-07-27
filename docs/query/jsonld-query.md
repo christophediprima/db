@@ -1527,6 +1527,7 @@ The default is `true`. Disable only when you are intentionally working with bare
 ## Related Documentation
 
 - [SPARQL](sparql.md): SPARQL query language
+- [Querying over MCP](mcp.md): Running FQL (and SPARQL) through the server's `/mcp` agent endpoint
 - [Time Travel](../concepts/time-travel.md): Historical queries
 - [Graph Sources](../concepts/graph-sources.md): Graph source queries
 - [Output Formats](output-formats.md): Query result formats
