@@ -11,11 +11,22 @@
 //! each writes new content-addressed snapshots plus/against a graph-source
 //! nameservice record (no key the server writes). `sync` is incremental
 //! (watermark-based) and lets a maintenance job keep an index current as its
-//! source ledger is materialized — there is no HTTP `sync`, and the standalone
-//! `fluree-search-httpd` is read-only, so this CLI is the way to advance an
-//! index. Querying the resulting index is done separately — through
-//! `fluree-search-httpd` (`POST /v1/search`, reading the same storage), or
-//! embedded via an FQL `f:searchText` query.
+//! source ledger is materialized. Querying the resulting index is done
+//! separately — through `fluree-search-httpd` (`POST /v1/search`, reading the
+//! same storage), or embedded via an FQL `f:searchText` query.
+//!
+//! # Who keeps an index fresh
+//!
+//! A running `fluree server` has a BM25 maintenance worker that re-syncs
+//! **tracked** indexes whenever their source ledger commits, so `sync` from a
+//! cron is only needed for indexes that opt out (`create --no-track`, listed by
+//! `list --untracked`). Tracking is persisted on the index record; `list` shows
+//! it in the TRACKED column.
+//!
+//! That worker is driven by the server's *in-process* event bus, which this
+//! one-shot CLI cannot publish on — so an index created here is invisible to a
+//! running server until it restarts (its start-up enumeration adopts every
+//! tracked index) or someone calls `POST /v1/fluree/bm25/track`.
 
 use crate::cli::Bm25Action;
 use crate::context::build_fluree;
@@ -36,6 +47,8 @@ pub async fn run(action: Bm25Action, dirs: &FlureeDir) -> CliResult<()> {
             query_file,
             k1,
             b,
+            no_track,
+            track: _,
         } => {
             run_create(
                 &name,
@@ -45,21 +58,40 @@ pub async fn run(action: Bm25Action, dirs: &FlureeDir) -> CliResult<()> {
                 query_file.as_deref(),
                 k1,
                 b,
+                !no_track,
                 dirs,
             )
             .await
         }
         Bm25Action::Drop { index, force } => run_drop(&index, force, dirs).await,
         Bm25Action::Sync { index } => run_sync(&index, dirs).await,
-        Bm25Action::List { stale } => run_list(stale, dirs).await,
+        Bm25Action::List { stale, untracked } => run_list(stale, untracked, dirs).await,
     }
 }
 
-/// List BM25 indexes with their source ledger and staleness — what a maintenance
-/// job enumerates to decide which to `sync`. An index is STALE when its source
-/// ledger's commit `t` has advanced past the index's watermark (`index_t`).
-async fn run_list(stale_only: bool, dirs: &FlureeDir) -> CliResult<()> {
+/// One row of `bm25 list`.
+struct IndexRow {
+    name: String,
+    branch: String,
+    source: String,
+    index_t: i64,
+    ledger_t: Option<i64>,
+    stale: bool,
+    tracked: bool,
+}
+
+/// List BM25 indexes with their source ledger, staleness and tracking — what a
+/// maintenance job enumerates to decide which to `sync`. An index is STALE when
+/// its source ledger's commit `t` has advanced past the index's watermark
+/// (`index_t`), and TRACKED when a running server's maintenance worker is meant
+/// to keep it fresh (persisted on the record; see `bm25 create --no-track`).
+///
+/// TRACKED is *intent*, not liveness: this CLI reads storage, not the server, so
+/// it cannot tell whether a worker process is actually up. `GET
+/// /v1/fluree/bm25/tracking` on the server answers that, and reports its pid.
+async fn run_list(stale_only: bool, untracked_only: bool, dirs: &FlureeDir) -> CliResult<()> {
     use comfy_table::{ContentArrangement, Table};
+    use fluree_db_api::bm25_tracked;
     use std::collections::HashMap;
 
     let fluree = build_fluree(dirs)?;
@@ -73,8 +105,7 @@ async fn run_list(stale_only: bool, dirs: &FlureeDir) -> CliResult<()> {
         .map(|r| (format!("{}:{}", r.name, r.branch), r.commit_t))
         .collect();
 
-    // (name, branch, source ledger, index_t, source commit_t?, stale)
-    let mut rows: Vec<(String, String, String, i64, Option<i64>, bool)> = sources
+    let mut rows: Vec<IndexRow> = sources
         .iter()
         .filter(|r| r.is_bm25() && !r.retracted)
         .map(|gs| {
@@ -86,25 +117,29 @@ async fn run_list(stale_only: bool, dirs: &FlureeDir) -> CliResult<()> {
                 .get(&source)
                 .or_else(|| commit_t.get(&format!("{source}:main")))
                 .copied();
-            let stale = ledger_t.is_some_and(|lt| gs.index_t < lt);
-            (
-                gs.name.clone(),
-                gs.branch.clone(),
+            IndexRow {
+                name: gs.name.clone(),
+                branch: gs.branch.clone(),
                 source,
-                gs.index_t,
+                index_t: gs.index_t,
                 ledger_t,
-                stale,
-            )
+                stale: ledger_t.is_some_and(|lt| gs.index_t < lt),
+                tracked: bm25_tracked(gs),
+            }
         })
         .collect();
-    rows.sort();
+    rows.sort_by(|a, b| (&a.name, &a.branch).cmp(&(&b.name, &b.branch)));
 
-    // Script-friendly mode: just the stale indexes, one alias per line, so a
-    // maintenance loop can do: `for i in $(fluree bm25 list --stale); do
-    // fluree bm25 sync --index "$i"; done`.
-    if stale_only {
-        for (name, branch, ..) in rows.iter().filter(|r| r.5) {
-            println!("{name}:{branch}");
+    // Script-friendly mode: just the aliases, one per line, so a maintenance
+    // loop can do: `for i in $(fluree bm25 list --stale --untracked); do
+    // fluree bm25 sync --index "$i"; done`. `--untracked` narrows that to the
+    // indexes no server worker is keeping fresh — the ones a cron still owns.
+    if stale_only || untracked_only {
+        for row in rows
+            .iter()
+            .filter(|r| (!stale_only || r.stale) && (!untracked_only || !r.tracked))
+        {
+            println!("{}:{}", row.name, row.branch);
         }
         return Ok(());
     }
@@ -124,24 +159,34 @@ async fn run_list(stale_only: bool, dirs: &FlureeDir) -> CliResult<()> {
         "INDEX_T",
         "LEDGER_T",
         "STALE",
+        "TRACKED",
     ]);
-    for (name, branch, source, index_t, ledger_t, stale) in &rows {
-        let index_t_str = if *index_t > 0 {
-            index_t.to_string()
+    for row in &rows {
+        let index_t_str = if row.index_t > 0 {
+            row.index_t.to_string()
         } else {
             "-".to_string()
         };
-        let ledger_t_str = ledger_t.map_or_else(|| "-".to_string(), |v| v.to_string());
+        let ledger_t_str = row
+            .ledger_t
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
         table.add_row(vec![
-            name.clone(),
-            branch.clone(),
-            source.clone(),
+            row.name.clone(),
+            row.branch.clone(),
+            row.source.clone(),
             index_t_str,
             ledger_t_str,
-            if *stale { "YES" } else { "no" }.to_string(),
+            if row.stale { "YES" } else { "no" }.to_string(),
+            if row.tracked { "yes" } else { "NO" }.to_string(),
         ]);
     }
     println!("{table}");
+    if rows.iter().any(|r| !r.tracked) {
+        println!(
+            "\nTRACKED=NO: no server maintenance worker keeps this index fresh — \
+             sync it yourself ('fluree bm25 list --untracked' lists them)."
+        );
+    }
     Ok(())
 }
 
@@ -154,6 +199,7 @@ async fn run_create(
     query_file: Option<&Path>,
     k1: Option<f64>,
     b: Option<f64>,
+    tracked: bool,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     // Resolve the indexing query: -e inline > -f file > stdin.
@@ -162,7 +208,9 @@ async fn run_create(
     let query: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| CliError::Input(format!("indexing query must be valid JSON: {e}")))?;
 
-    let mut config = Bm25CreateConfig::new(name, ledger, query).with_branch(branch);
+    let mut config = Bm25CreateConfig::new(name, ledger, query)
+        .with_branch(branch)
+        .with_tracked(tracked);
     if let Some(k1) = k1 {
         config = config.with_k1(k1);
     }
@@ -186,9 +234,21 @@ async fn run_create(
         .map_err(CliError::Api)?;
 
     println!(
-        "Created full-text index {} (docs={}, terms={}, index_t={}).",
-        result.graph_source_id, result.doc_count, result.term_count, result.index_t
+        "Created full-text index {} (docs={}, terms={}, index_t={}, tracked={}).",
+        result.graph_source_id, result.doc_count, result.term_count, result.index_t, tracked
     );
+    if tracked {
+        println!(
+            "  A running server adopts it at its next restart, or right away via \
+             POST /v1/fluree/bm25/track {{\"index\":\"{}\"}}.",
+            result.graph_source_id
+        );
+    } else {
+        println!(
+            "  Not tracked — sync it yourself: fluree bm25 sync --index {}.",
+            result.graph_source_id
+        );
+    }
     Ok(())
 }
 

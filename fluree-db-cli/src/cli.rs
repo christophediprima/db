@@ -1184,6 +1184,26 @@ pub enum Bm25Action {
         /// BM25 b (document-length normalization, 0..=1). Default 0.75.
         #[arg(long)]
         b: Option<f64>,
+
+        /// Do NOT let a running `fluree server` keep this index fresh.
+        ///
+        /// By default a new index is marked **tracked**: the server's BM25
+        /// maintenance worker re-syncs it whenever the source ledger commits.
+        /// Pass this for an index you want to sync on your own schedule — a
+        /// point-in-time snapshot, or one whose resync is too costly to run on
+        /// every commit. The flag is persisted on the index record (shown in
+        /// the TRACKED column of `fluree bm25 list`) and can be flipped later
+        /// via the server's `POST /v1/fluree/bm25/track|untrack`.
+        ///
+        /// Note the index still has to be *adopted* by a running server: it
+        /// hears no events from this one-shot CLI process, so it picks the
+        /// index up at its next restart, or immediately on `POST /bm25/track`.
+        #[arg(long, conflicts_with = "track")]
+        no_track: bool,
+
+        /// Mark the index tracked (the default) — stated explicitly.
+        #[arg(long)]
+        track: bool,
     },
 
     /// Drop (retract) a BM25 full-text index and delete its snapshots.
@@ -1214,16 +1234,31 @@ pub enum Bm25Action {
 
     /// List BM25 full-text indexes with their source ledger and staleness.
     ///
+    /// List BM25 full-text indexes with their source ledger and staleness.
+    ///
     /// For each index: its alias, the source ledger it covers, the index
-    /// watermark (`index_t`), the source ledger's current `t`, and whether the
-    /// index is STALE (source advanced past the index). This is what a
-    /// maintenance job enumerates to decide which indexes to `sync` — unlike
-    /// `fluree list`, it shows the source ledger and staleness. With `--stale`,
-    /// print only stale indexes (one alias per line, for scripting a sync loop).
+    /// watermark (`index_t`), the source ledger's current `t`, whether the
+    /// index is STALE (source advanced past the index), and whether it is
+    /// TRACKED (a running server's maintenance worker is meant to keep it
+    /// fresh). This is what a maintenance job enumerates to decide which
+    /// indexes to `sync` — unlike `fluree list`, it shows the source ledger and
+    /// staleness. With `--stale`, print only stale indexes (one alias per line,
+    /// for scripting a sync loop).
+    ///
+    /// TRACKED is the persisted *intent*, read from the index record. Whether a
+    /// worker is actually running — and in which process — is per-server
+    /// runtime state this local CLI can't see; ask the server itself with
+    /// `GET /v1/fluree/bm25/tracking`, which reports its pid and live registrations.
     List {
         /// Print only stale indexes, one alias per line (script-friendly).
         #[arg(long)]
         stale: bool,
+
+        /// Print only indexes NOT tracked by a server's maintenance worker —
+        /// the ones a `sync` cron still has to cover. Combines with `--stale`
+        /// to list exactly what needs syncing by hand.
+        #[arg(long)]
+        untracked: bool,
     },
 }
 
