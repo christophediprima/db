@@ -26,6 +26,19 @@ use tracing::{info, warn};
 /// Caps socket pressure and S3 throttling for large indexes with many leaflets.
 const BM25_IO_CONCURRENCY: usize = 32;
 
+/// Whether a server's BM25 maintenance worker should keep this index fresh.
+///
+/// Reads the `tracked` flag persisted in the graph-source record's config by
+/// [`Bm25CreateConfig::tracked`]. **Absent means tracked**: records written
+/// before the flag existed keep being maintained, which is what their authors
+/// got at the time.
+pub fn bm25_tracked(record: &fluree_db_nameservice::GraphSourceRecord) -> bool {
+    serde_json::from_str::<JsonValue>(&record.config)
+        .ok()
+        .and_then(|c| c.get("tracked").and_then(JsonValue::as_bool))
+        .unwrap_or(true)
+}
+
 /// Best-effort deletion of old snapshot blobs from storage.
 /// Derives storage addresses from CIDs using the graph source namespace.
 /// Logs warnings on failure but does not propagate errors.
@@ -171,6 +184,7 @@ impl crate::Fluree {
             "k1": config.k1.unwrap_or(1.2),
             "b": config.b.unwrap_or(0.75),
             "query": config.query,
+            "tracked": config.tracked,
         }))?;
 
         self.publisher()?
@@ -817,6 +831,62 @@ impl crate::Fluree {
             is_stale,
             lag,
         })
+    }
+
+    /// Set whether a server's BM25 maintenance worker should keep this index
+    /// fresh. Returns the previous value.
+    ///
+    /// This rewrites only the `tracked` key of the persisted config — the
+    /// indexing query, `k1`/`b`, dependencies and the index watermark are
+    /// untouched (config and index heads are separate nameservice records).
+    /// Republishing the config emits `GraphSourceConfigPublished`, so a worker
+    /// in this process picks the change up without being told twice.
+    pub async fn set_bm25_tracked(&self, graph_source_id: &str, tracked: bool) -> Result<bool> {
+        let record = self
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await?
+            .ok_or_else(|| {
+                crate::ApiError::NotFound(format!("Graph source not found: {graph_source_id}"))
+            })?;
+
+        if !record.is_bm25() {
+            return Err(crate::ApiError::Config(format!(
+                "Not a BM25 graph source: {graph_source_id} (type {:?})",
+                record.source_type
+            )));
+        }
+        if record.retracted {
+            return Err(crate::ApiError::Drop(format!(
+                "Cannot change tracking on a retracted graph source: {graph_source_id}"
+            )));
+        }
+
+        let was_tracked = bm25_tracked(&record);
+        if was_tracked == tracked {
+            return Ok(was_tracked);
+        }
+
+        let mut config: JsonValue = serde_json::from_str(&record.config)?;
+        let JsonValue::Object(ref mut map) = config else {
+            return Err(crate::ApiError::Config(format!(
+                "Graph source config is not a JSON object: {graph_source_id}"
+            )));
+        };
+        map.insert("tracked".to_string(), JsonValue::Bool(tracked));
+
+        self.publisher()?
+            .publish_graph_source(
+                &record.name,
+                &record.branch,
+                GraphSourceType::Bm25,
+                &serde_json::to_string(&config)?,
+                &record.dependencies,
+            )
+            .await?;
+
+        info!(graph_source_id = %graph_source_id, tracked, "Updated BM25 index tracking");
+        Ok(was_tracked)
     }
 }
 

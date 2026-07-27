@@ -182,6 +182,8 @@ pub use iceberg_validate::ValidateR2rmlResponse;
 #[cfg(feature = "iceberg")]
 pub use config::{R2rmlCreateConfig, R2rmlMappingInput};
 
+pub use bm25::bm25_tracked;
+
 // Re-export result types
 pub use result::Bm25CreateResult;
 pub use result::Bm25DropResult;
