@@ -52,6 +52,16 @@ pub struct Bm25CreateConfig {
 
     /// BM25 b parameter (document length normalization). Default: 0.75
     pub b: Option<f64>,
+
+    /// Whether a server's BM25 maintenance worker should keep this index
+    /// fresh as its source ledger commits. Default: `true`.
+    ///
+    /// Persisted on the graph-source record, so it survives restarts and is
+    /// visible to any process reading the nameservice (`fluree bm25 list`).
+    /// Set it to `false` for an index you want to sync on your own schedule —
+    /// a point-in-time snapshot, or one whose resync is too expensive to run
+    /// on every commit. `POST /v1/fluree/bm25/track|untrack` flips it later.
+    pub tracked: bool,
 }
 
 impl Bm25CreateConfig {
@@ -64,7 +74,15 @@ impl Bm25CreateConfig {
             query,
             k1: None,
             b: None,
+            tracked: true,
         }
+    }
+
+    /// Set whether a server's maintenance worker should keep this index fresh.
+    /// See [`Bm25CreateConfig::tracked`].
+    pub fn with_tracked(mut self, tracked: bool) -> Self {
+        self.tracked = tracked;
+        self
     }
 
     /// Set the branch name.
