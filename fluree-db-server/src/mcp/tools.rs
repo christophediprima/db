@@ -59,6 +59,48 @@ pub struct GetDataModelRequest {
     pub ledger: String,
 }
 
+/// Request parameters for the FQL (Fluree JSON-LD) query tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FqlQueryRequest {
+    /// The FQL query object (Fluree JSON-LD query language).
+    #[schemars(
+        description = "A Fluree FQL query object (Fluree's native JSON-LD query language). Must be \
+        a SELECT-style query: include a `from` (the ledger or graph-source alias to query, e.g. \
+        'mydb:main'), a `where` pattern, and a `select` / `selectOne` / `selectDistinct` clause. \
+        Unlike sparql_query, FQL can express a BM25 full-text search block — `f:graphSource` + \
+        `f:searchText` (+ optional `f:searchLimit`) + `f:searchResult` binding `f:resultId` / \
+        `f:resultScore` — and JOIN its ranked hits with graph data in the SAME query. Use this for \
+        keyword / full-text retrieval (the graph-aware RAG pattern); use sparql_query for plain \
+        graph queries. Example: {\"@context\":{\"f\":\"https://ns.flur.ee/db#\",\
+        \"as\":\"https://www.w3.org/ns/activitystreams#\"},\"from\":\"mydb:main\",\"where\":[\
+        {\"f:graphSource\":\"mydb_bm25:main\",\"f:searchText\":\"nature\",\"f:searchLimit\":10,\
+        \"f:searchResult\":{\"f:resultId\":\"?doc\",\"f:resultScore\":\"?score\"}},\
+        {\"@id\":\"?doc\",\"@type\":\"?type\",\"as:name\":\"?name\"}],\
+        \"select\":[\"?doc\",\"?type\",\"?score\",\"?name\"]}"
+    )]
+    pub query: serde_json::Value,
+}
+
+/// Force the authenticated `identity` into the query's `opts.identity`, overriding
+/// any client-supplied value. Mirrors the HTTP query route's non-impersonation
+/// path (`policy_auth::force_auth_opts`): the caller's identity is set by the MCP
+/// token, never by the query body, so the query always runs under that identity's
+/// read policy and cannot be spoofed into another identity.
+fn force_identity_opts(query: &mut serde_json::Value, identity: &str) {
+    let Some(obj) = query.as_object_mut() else {
+        return;
+    };
+    let opts = obj
+        .entry("opts")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(opts_obj) = opts.as_object_mut() {
+        opts_obj.insert(
+            "identity".to_string(),
+            serde_json::Value::String(identity.to_string()),
+        );
+    }
+}
+
 /// MCP tool service for Fluree DB
 ///
 /// Provides tools for:
@@ -279,6 +321,156 @@ impl FlureeToolService {
         obj.insert("message".to_string(), serde_json::Value::String(message));
     }
 
+    /// Execute an FQL (Fluree JSON-LD) query against a Fluree ledger
+    #[tool(
+        description = "Execute a Fluree FQL (JSON-LD) SELECT query against a Fluree ledger (the \
+        ledger is named by the query's own `from` clause). Use this INSTEAD of sparql_query when \
+        the query needs a BM25 full-text search — a `f:searchText` block is FQL-only and returns \
+        NOTHING under SPARQL. FQL can search by keyword and join the ranked hits with graph data \
+        in one query (the graph-aware RAG pattern): put an `f:graphSource` + `f:searchText` + \
+        `f:searchResult` block in `where` to bind `?doc`/`?score`, then match `{\"@id\":\"?doc\", \
+        …}` to pull each hit's properties. Returns the same compact Agent JSON envelope as \
+        sparql_query (`schema`, `rows`, `rowCount`, `t`, `hasMore`); when `hasMore` is true the \
+        result was truncated to a byte budget — narrow the query or add `f:searchLimit` / an FQL \
+        `limit`. Call get_data_model first to learn the classes and properties."
+    )]
+    async fn fql_query(
+        &self,
+        Parameters(req): Parameters<FqlQueryRequest>,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let start = std::time::Instant::now();
+
+        // Extract identity from MCP principal for policy enforcement
+        let principal = extract_principal(&context);
+        let identity = principal.as_ref().and_then(|p| p.identity.as_deref());
+
+        tracing::info!(
+            identity = ?identity,
+            "MCP fql_query tool invoked"
+        );
+
+        let max_bytes = self.state.config.mcp_agent_json_max_bytes;
+        let result = self
+            .execute_fql_agent_json(&req.query, identity, max_bytes)
+            .await;
+
+        match result {
+            Ok(envelope) => {
+                let elapsed = start.elapsed();
+                tracing::info!(elapsed_ms = elapsed.as_millis(), "MCP fql_query succeeded");
+                // Compact serialization — the formatter already applied the byte budget.
+                let text =
+                    serde_json::to_string(&envelope).unwrap_or_else(|_| envelope.to_string());
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(e) => {
+                let elapsed = start.elapsed();
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis(),
+                    error = %e,
+                    "MCP fql_query failed"
+                );
+                // Return error as tool error content (learnable by LLM)
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "FQL query error: {e}"
+                ))]))
+            }
+        }
+    }
+
+    /// Execute an FQL query and format the result as an Agent JSON envelope.
+    ///
+    /// Extracted from [`fql_query`](Self::fql_query) so it can be exercised in tests without an
+    /// rmcp `RequestContext`. Runs through the same connection path as the HTTP `/v1/fluree/query`
+    /// route ([`run_jsonld_subquery`]), which wires the BM25 index provider onto the query context
+    /// — so an embedded `f:searchText` block executes in-process.
+    ///
+    /// - `identity` — the caller's resolved identity. **Required**: it is forced into
+    ///   `opts.identity` so the query runs under that identity's read policy. If it is `None`
+    ///   the tool fails closed (see below) rather than run unpoliced — because, unlike
+    ///   `sparql_query`, an FQL body can carry its own `opts.identity`, so an identity-less
+    ///   caller could otherwise pick any identity.
+    /// - `max_bytes` — byte budget; rows beyond it are dropped and the envelope reports
+    ///   `hasMore: true`.
+    ///
+    /// [`run_jsonld_subquery`]: fluree_db_api::query::multi::run_jsonld_subquery
+    pub async fn execute_fql_agent_json(
+        &self,
+        query: &serde_json::Value,
+        identity: Option<&str>,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value, fluree_db_api::ApiError> {
+        // The Agent JSON envelope assumes a SELECT solution table. FQL node/graph queries
+        // (no select clause) produce a JSON-LD graph with no such shape, so reject them up
+        // front — mirroring sparql_query's SELECT-only contract.
+        let is_select = [
+            "select",
+            "selectOne",
+            "select-one",
+            "selectDistinct",
+            "select-distinct",
+        ]
+        .iter()
+        .any(|k| query.get(*k).is_some());
+        if !is_select {
+            return Err(fluree_db_api::ApiError::http(
+                400,
+                "fql_query supports SELECT-style FQL only; include a `select`, `selectOne`, or \
+                 `selectDistinct` clause",
+            ));
+        }
+        if query.get("from").is_none() {
+            return Err(fluree_db_api::ApiError::http(
+                400,
+                "fql_query requires a `from` clause naming the ledger or graph-source alias to \
+                 query",
+            ));
+        }
+
+        // Fail closed on a missing identity. `validate_mcp_token` accepts identity-less tokens
+        // (require_identity = false), and an FQL body can carry its own `opts.identity` — so
+        // running without a resolved identity would let a caller read under any identity it names.
+        // Refuse instead. (`sparql_query` needs no such guard: its body cannot supply an identity,
+        // so an identity-less call there merely runs unpoliced, with no spoofing vector.)
+        let identity = identity.ok_or_else(|| {
+            fluree_db_api::ApiError::http(
+                401,
+                "fql_query requires an authenticated identity; the MCP token must carry a \
+                 `fluree.identity` (or `sub`) claim — refusing to run without one",
+            )
+        })?;
+
+        // Force the authenticated identity into opts so the query runs under that identity's
+        // read policy — cannot be spoofed by a client-supplied `opts.identity`.
+        let mut query = query.clone();
+        force_identity_opts(&mut query, identity);
+
+        let config = fluree_db_api::FormatterConfig::agent_json().with_max_bytes(max_bytes);
+        let state = self.state.clone();
+        let timeout_ms = state.config.mcp_query_timeout_ms;
+
+        let mut envelope = crate::query_control::run_query_task(timeout_ms, move || async move {
+            let execution = crate::query_control::current_query_execution_options(timeout_ms);
+            let out = fluree_db_api::query::multi::run_jsonld_subquery(
+                state.fluree.as_ref(),
+                &query,
+                Some(config),
+                execution,
+            )
+            .await?;
+            Ok(out.data)
+        })
+        .await
+        .map_err(|e| match e {
+            crate::error::ServerError::Api(api) => api,
+            other => fluree_db_api::ApiError::Internal(other.to_string()),
+        })?;
+
+        Self::annotate_pagination(&mut envelope);
+        Ok(envelope)
+    }
+
     /// Get the data model (schema) for a Fluree ledger
     #[tool(
         description = "Get the data model (schema) of a Fluree ledger as markdown. Returns classes, properties, instance counts, and statistics. CRITICAL: Use this before sparql_query to understand what data exists."
@@ -342,7 +534,11 @@ impl ServerHandler for FlureeToolService {
                  - sparql_query: Execute a SPARQL SELECT query against a ledger. Returns a \
                    compact Agent JSON envelope (schema, rows, rowCount, t, hasMore). When hasMore \
                    is true, paginate by re-running with the same `t`, an ORDER BY, and OFFSET \
-                   advanced by the returned rowCount."
+                   advanced by the returned rowCount.\n\
+                 - fql_query: Execute a Fluree FQL (JSON-LD) SELECT query. Use this instead of \
+                   sparql_query when you need BM25 full-text search (`f:searchText`), which is \
+                   FQL-only — search by keyword and join the ranked hits with graph data in one \
+                   query. Returns the same Agent JSON envelope."
                     .to_string(),
             ),
         }
