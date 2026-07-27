@@ -2711,7 +2711,7 @@ Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sou
 
 ## Graph Source Endpoints
 
-> **Note:** HTTP endpoints for BM25 and vector index lifecycle management (create, sync, drop) are not yet implemented in the server. BM25 and vector indexes are currently managed via the Rust API (`Bm25CreateConfig`, `create_full_text_index`, `sync_bm25_index`, `drop_full_text_index`). See [BM25 Full-Text Search](../indexing-and-search/bm25.md) and [Vector Search](../indexing-and-search/vector-search.md) for API usage.
+> **Note:** HTTP endpoints for BM25 and vector index *lifecycle* management (create, drop) are not yet implemented in the server. BM25 and vector indexes are created via the Rust API (`Bm25CreateConfig`, `create_full_text_index`, `drop_full_text_index`) or the `fluree bm25` CLI. BM25 index **maintenance** is served over HTTP — see [`/bm25/track`](#post-api_base_urlbm25track) below. See [BM25 Full-Text Search](../indexing-and-search/bm25.md) and [Vector Search](../indexing-and-search/vector-search.md) for API usage.
 >
 > BM25 search **is** available in queries via the `f:graphSource` / `f:searchText` pattern in where clauses — see the query documentation for details.
 
@@ -2793,6 +2793,79 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 - `500 Internal Server Error` — catalog connection or mapping failure
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
+
+### POST {api_base_url}/bm25/track
+
+Mark a BM25 full-text index **tracked**, adopt it into this node's maintenance worker, and sync it immediately. The worker then re-syncs the index whenever a ledger it depends on commits (debounced). Admin-protected.
+
+Tracked indexes are adopted automatically at server start-up and when created in-process, so `track` is for the case the server can't see: an index created by a *separate* process — `fluree bm25 create`, typically under `docker exec` — which publishes no event this node hears. Call it once after creating such an index and the server takes over from there.
+
+The flag is **persisted on the index record**, so it survives restarts and is visible to any process reading the nameservice (`fluree bm25 list` shows a `TRACKED` column). An index created with `fluree bm25 create --no-track` starts untracked and is never adopted; `track` is how you change your mind.
+
+**Request Body:**
+
+```json
+{ "index": "article-search:main" }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | string | BM25 index id (`name` or `name:branch`). Required. Must name an existing, non-retracted BM25 graph source. |
+
+**Response:**
+
+```json
+{
+  "index": "article-search:main",
+  "tracked": true,
+  "was_tracked": false,
+  "tracked_indexes": 1,
+  "initial": {
+    "graph_source_id": "article-search:main",
+    "upserted": 120,
+    "removed": 0,
+    "affected_subjects": 120,
+    "old_watermark": 4,
+    "new_watermark": 9,
+    "was_full_resync": false
+  }
+}
+```
+
+`old_watermark == new_watermark` with zero counts means the index was already at its source ledger's head — `track` is idempotent and re-tracking costs a nameservice read.
+
+**Status Codes:** `200 OK`; `404` unknown index; `400` retracted or non-BM25 index, or no maintenance worker on this node (peer-mode requests are forwarded to the transaction server instead); `401/403` admin auth; `500` sync failure.
+
+### POST {api_base_url}/bm25/untrack
+
+Stop maintaining an index. The index and its snapshots are left in place — only maintenance stops. Body: `{ "index": "article-search:main" }`. Response: `{ "index", "removed": true, "was_tracked": true, "tracked_indexes": 0 }`.
+
+This clears the persisted `tracked` flag, so it is durable: a restart will not quietly re-adopt the index. `removed` reports whether *this node's* worker had it registered; `was_tracked` reports what the record said before the call.
+
+### GET {api_base_url}/bm25/tracking
+
+List the maintenance worker's indexes with live staleness, plus cumulative stats. Staleness is a nameservice read per index (no index bytes are loaded). `pid` is the answering server's process id — the worker is in-process, so this is the one thing a nameservice-only reader like `fluree bm25 list` cannot tell you.
+
+```json
+{
+  "running": true,
+  "pid": 4711,
+  "watched_ledgers": ["articles:main"],
+  "indexes": [
+    {
+      "index": "article-search:main",
+      "source_ledger": "articles:main",
+      "index_t": 9,
+      "ledger_t": 9,
+      "is_stale": false,
+      "lag": 0
+    }
+  ],
+  "stats": { "syncs_performed": 3, "syncs_failed": 0, "events_received": 27, "registered_graph_sources": 1 }
+}
+```
+
+`{"running": false, "indexes": []}` means this node has no maintenance worker — expected on peer-mode nodes, which forward writes and therefore observe no commit events. An index missing from `indexes` on a running worker is untracked (see `--no-track` / `untrack`).
 
 ## Admin Endpoints
 
