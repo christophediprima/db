@@ -102,6 +102,15 @@ pub struct AppState {
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// Handle to the BM25 maintenance worker, which keeps full-text indexes
+    /// fresh as their source ledgers commit. `None` on peer-mode nodes (which
+    /// forward writes, so they see no commit events) or when the worker failed
+    /// to start.
+    pub bm25_worker: Option<fluree_db_api::Bm25WorkerHandle>,
+
+    /// Join handle for the BM25 maintenance worker task; aborted on drop.
+    bm25_worker_task: Option<tokio::task::JoinHandle<()>>,
+
     /// Registry of in-flight negotiated-upload import jobs (reference impl of
     /// the presigned `.flpack` upload flow). Empty/unused unless
     /// `config.import_presign_enabled`.
@@ -271,6 +280,24 @@ impl AppState {
         #[cfg(feature = "aws")]
         let storage_vend_scope = resolve_storage_vend_scope(&config);
 
+        // Spawn the BM25 maintenance worker on write nodes. It is driven by
+        // this instance's in-process event bus, which only the process that
+        // *writes* a commit publishes on — so it belongs on the write node and
+        // nowhere else. Peers forward writes and would never be woken.
+        //
+        // (Raft: `with_fluree` runs on every node, so a cluster would run one
+        // worker per node, each syncing the same index. Gating background
+        // workers to the leader is an open question that predates this one;
+        // single-node and peer deployments are correct today.)
+        let (bm25_worker, bm25_worker_task) = if config.server_role != ServerRole::Peer {
+            let worker = fluree_db_api::Bm25MaintenanceWorker::new(Arc::clone(&fluree));
+            let handle = worker.handle();
+            let task = tokio::spawn(worker.run());
+            (Some(handle), Some(task))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             fluree,
             config,
@@ -289,6 +316,8 @@ impl AppState {
             query_refresh_last_checked: DashMap::new(),
             serving_posture_cache: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
+            bm25_worker,
+            bm25_worker_task,
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
             #[cfg(feature = "aws")]
             storage_vend_scope,
@@ -354,6 +383,9 @@ impl Drop for AppState {
     fn drop(&mut self) {
         if let Some(handle) = self.cache_stats_handle.take() {
             handle.abort();
+        }
+        if let Some(task) = self.bm25_worker_task.take() {
+            task.abort();
         }
     }
 }
