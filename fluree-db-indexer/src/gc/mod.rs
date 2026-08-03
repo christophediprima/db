@@ -52,9 +52,11 @@
 //! chains trade delay for disk.
 
 pub(crate) mod collector;
+pub mod orphan_sweep;
 mod record;
 
 pub use collector::clean_garbage;
+pub use orphan_sweep::{sweep_orphans, OrphanSweepConfig, OrphanSweepReport};
 pub use record::GarbageRecord;
 
 use crate::error::Result;
