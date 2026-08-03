@@ -225,6 +225,24 @@ struct LedgerIndexState {
     retry_count: u32,
     /// When to retry next (if in backoff)
     next_retry_at: Option<tokio::time::Instant>,
+    /// When this ledger's deferred, post-quiescence GC pass becomes due.
+    ///
+    /// GC previously ran ONLY in the success branch after a publish, which left
+    /// two gaps that compound into unbounded storage:
+    ///
+    /// 1. A ledger that caught up and stopped publishing was never collected
+    ///    again — its whole retained index history was pinned for as long as it
+    ///    stayed quiet, which for a backfill-then-idle workload is forever.
+    /// 2. The pass that *did* run fired the instant the last index landed, when
+    ///    every recent garbage record was still younger than `gc_min_time_mins`
+    ///    and so skipped by the collector's age guard. The final pass could
+    ///    therefore collect almost nothing precisely when it mattered most.
+    ///
+    /// So schedule ONE pass `gc_min_time_mins` after the ledger goes idle, by
+    /// which time those records have aged past the guard and are collectible.
+    /// Deliberately not a periodic sweep: exactly one deferred pass per
+    /// quiescence, cleared when it fires, so an idle ledger costs nothing.
+    gc_due_at: Option<tokio::time::Instant>,
 }
 
 impl Default for LedgerIndexState {
@@ -238,6 +256,7 @@ impl Default for LedgerIndexState {
             cancelled: false,
             retry_count: 0,
             next_retry_at: None,
+            gc_due_at: None,
         }
     }
 }
@@ -267,15 +286,26 @@ impl LedgerIndexState {
         self.waiters = remaining;
     }
 
-    /// Recalculate pending_min_t from remaining waiters
-    fn recalculate_pending_min_t(&mut self) {
+    /// Recalculate pending_min_t from remaining waiters.
+    ///
+    /// `gc_idle_delay` is how far out to schedule this ledger's one deferred GC
+    /// pass when it goes idle — see [`LedgerIndexState::gc_due_at`].
+    fn recalculate_pending_min_t(&mut self, gc_idle_delay: std::time::Duration) {
         self.pending_min_t = self.waiters.iter().map(|(min_t, _)| *min_t).min();
         if self.pending_min_t.is_none() {
+            let was_idle = self.phase == IndexPhase::Idle;
             self.phase = IndexPhase::Idle;
             // An Idle ledger has nothing to retry; a lingering deadline here
             // would otherwise keep waking (and hot-spin) the worker loop —
             // see `is_processable` and the retry-deadline computation in run().
             self.next_retry_at = None;
+            // Schedule the deferred GC pass only on the TRANSITION into idle, and
+            // never overwrite one already pending: a ledger that flaps idle/busy
+            // must not accumulate deadlines, nor keep pushing its own collection
+            // further out each time it briefly goes quiet.
+            if !was_idle && self.gc_due_at.is_none() && !self.cancelled {
+                self.gc_due_at = Some(tokio::time::Instant::now() + gc_idle_delay);
+            }
         }
     }
 
@@ -810,6 +840,13 @@ pub struct BackgroundIndexerWorker {
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
 const MAX_CONCURRENT_GC: usize = 4;
 
+/// Margin added to the deferred idle-GC delay.
+///
+/// The collector skips any garbage record younger than `gc_min_time_mins`, so
+/// firing at exactly that boundary races the guard and can collect nothing.
+/// Land clear of it instead.
+const GC_IDLE_DELAY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl BackgroundIndexerWorker {
     /// Create a new worker and its associated handle.
     ///
@@ -850,6 +887,91 @@ impl BackgroundIndexerWorker {
         };
 
         (worker, handle)
+    }
+
+    /// Shared [`crate::gc::CleanGarbageConfig`] for every GC path, so the
+    /// post-publish pass and the deferred idle pass can never drift apart in
+    /// retention thresholds or artifact-cache location.
+    fn gc_config(&self) -> crate::gc::CleanGarbageConfig {
+        crate::gc::CleanGarbageConfig {
+            max_old_indexes: Some(self.config.gc_max_old_indexes),
+            min_time_garbage_mins: Some(self.config.gc_min_time_mins),
+            artifact_cache_dir: Some(
+                self.config
+                    .data_dir
+                    .as_ref()
+                    .map(|d| d.join("binary_artifact_cache"))
+                    .unwrap_or_else(|| std::env::temp_dir().join("fluree_binary_cache")),
+            ),
+        }
+    }
+
+    /// How long after a ledger goes idle to run its one deferred GC pass:
+    /// the collector's own age guard plus [`GC_IDLE_DELAY_MARGIN`].
+    fn gc_idle_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.config.gc_min_time_mins) * 60)
+            + GC_IDLE_DELAY_MARGIN
+    }
+
+    /// Run one deferred GC pass for a ledger that has gone idle.
+    ///
+    /// Mirrors the post-publish pass — same collector, same config, same
+    /// concurrency cap, failures non-fatal — with one difference: there is no
+    /// fresh build result to take the root from, so it is resolved from the
+    /// nameservice's published index head.
+    ///
+    /// Skipping is always safe. The collector re-scans the whole prev-index
+    /// chain on every run, so nothing is lost by a dropped pass; the ledger
+    /// simply keeps its history until its next quiescence or next publish.
+    async fn spawn_idle_gc(&self, ledger_id: &str) {
+        let Ok(gc_permit) = Arc::clone(&self.gc_semaphore).try_acquire_owned() else {
+            debug!(
+                ledger_id,
+                max_concurrent_gc = MAX_CONCURRENT_GC,
+                "Skipping deferred idle GC; concurrency cap reached"
+            );
+            return;
+        };
+        let root_id = match self.nameservice.lookup(ledger_id).await {
+            Ok(Some(record)) => record.index_head_id,
+            Ok(None) => {
+                debug!(ledger_id, "Skipping deferred idle GC; ledger not found");
+                return;
+            }
+            Err(e) => {
+                debug!(ledger_id, error = %e, "Skipping deferred idle GC; lookup failed");
+                return;
+            }
+        };
+        // No published index yet means nothing has been built, so there is no
+        // prev-index chain and nothing to collect.
+        let Some(root_id) = root_id else {
+            debug!(ledger_id, "Skipping deferred idle GC; no published index");
+            return;
+        };
+        let gc_store = self.backend.content_store(ledger_id);
+        let gc_config = self.gc_config();
+        let gc_ledger_id = ledger_id.to_string();
+        tokio::spawn(async move {
+            // Hold the permit for the task's lifetime; dropping it on completion
+            // frees a GC slot.
+            let _gc_permit = gc_permit;
+            match crate::gc::clean_garbage(gc_store.as_ref(), &root_id, gc_config).await {
+                Ok(result) => debug!(
+                    ledger_id = %gc_ledger_id,
+                    root_id = %root_id,
+                    indexes_cleaned = result.indexes_cleaned,
+                    nodes_deleted = result.nodes_deleted,
+                    "Deferred idle GC completed"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    ledger_id = %gc_ledger_id,
+                    root_id = %root_id,
+                    "Deferred idle GC failed (non-fatal)"
+                ),
+            }
+        });
     }
 
     /// Attach a [`LedgerEventBus`]. [`run`](Self::run) subscribes,
@@ -897,11 +1019,23 @@ impl BackgroundIndexerWorker {
             // in lockstep with the processing scan below.
             let retry_deadline = {
                 let states = self.states.lock().await;
-                states
+                let retry = states
                     .values()
                     .filter(|s| s.is_processable())
                     .filter_map(|s| s.next_retry_at)
-                    .min()
+                    .min();
+                // Deferred idle-GC deadlines are collected SEPARATELY and must NOT
+                // be filtered by `is_processable()`: an idle ledger has no pending
+                // work by definition, so that filter would discard precisely the
+                // deadlines this exists to serve. Safe against hot-spinning because
+                // `gc_due_at` is cleared the moment it fires (see below), so a
+                // past-due deadline cannot survive to make `sleep_until` return
+                // immediately on every subsequent iteration.
+                let gc = states.values().filter_map(|s| s.gc_due_at).min();
+                match (retry, gc) {
+                    (Some(r), Some(g)) => Some(r.min(g)),
+                    (r, g) => r.or(g),
+                }
             };
 
             // Wait for tick OR retry deadline (whichever comes first),
@@ -950,8 +1084,33 @@ impl BackgroundIndexerWorker {
                     .collect()
             };
 
+            // Fire any deferred idle-GC passes that have come due. `gc_due_at` is
+            // cleared while the lock is held, BEFORE spawning, which is what makes
+            // this one-shot per quiescence and stops a past-due deadline from
+            // hot-spinning the wait above. The phase is re-checked because the
+            // ledger may have been triggered again, or cancelled, while the
+            // deadline was pending — in either case its GC comes from the normal
+            // post-publish path instead.
+            let gc_due: Vec<String> = {
+                let mut states = self.states.lock().await;
+                let mut due = Vec::new();
+                for (ledger_id, state) in states.iter_mut() {
+                    if state.gc_due_at.is_some_and(|t| t <= now) {
+                        state.gc_due_at = None;
+                        if state.phase == IndexPhase::Idle && !state.cancelled {
+                            due.push(ledger_id.clone());
+                        }
+                    }
+                }
+                due
+            };
+            for ledger_id in &gc_due {
+                self.spawn_idle_gc(ledger_id).await;
+            }
+
             debug!(
                 ledger_count = ledgers_to_process.len(),
+                idle_gc_fired = gc_due.len(),
                 has_retry_deadline = retry_deadline.is_some(),
                 "Background indexer worker tick"
             );
@@ -1234,7 +1393,7 @@ impl BackgroundIndexerWorker {
                                 fuel: Some(0.0),
                             };
                             state.resolve_waiters_below(current_index_t, outcome);
-                            state.recalculate_pending_min_t();
+                            state.recalculate_pending_min_t(self.gc_idle_delay());
                             state.retry_count = 0;
                             state.next_retry_at = None;
                             state.last_error = None;
@@ -1263,7 +1422,7 @@ impl BackgroundIndexerWorker {
                                 fuel: Some(0.0),
                             };
                             state.resolve_waiters_below(current_index_t, outcome);
-                            state.recalculate_pending_min_t();
+                            state.recalculate_pending_min_t(self.gc_idle_delay());
                             state.retry_count = 0;
                             state.next_retry_at = None;
                             state.last_error = None;
@@ -1361,7 +1520,7 @@ impl BackgroundIndexerWorker {
                     state.retry_count = state.retry_count.saturating_add(1);
                     return;
                 }
-                state.recalculate_pending_min_t();
+                state.recalculate_pending_min_t(self.gc_idle_delay());
                 if state.pending_min_t.is_some() {
                     state.phase = IndexPhase::Pending;
                 }
@@ -1496,19 +1655,7 @@ impl BackgroundIndexerWorker {
                         let gc_ns = Arc::clone(&self.nameservice);
                         let gc_ledger_id = index_result.ledger_id.clone();
                         let gc_index_t = index_result.index_t;
-                        let gc_config = crate::gc::CleanGarbageConfig {
-                            max_old_indexes: Some(self.config.gc_max_old_indexes),
-                            min_time_garbage_mins: Some(self.config.gc_min_time_mins),
-                            artifact_cache_dir: Some(
-                                self.config
-                                    .data_dir
-                                    .as_ref()
-                                    .map(|d| d.join("binary_artifact_cache"))
-                                    .unwrap_or_else(|| {
-                                        std::env::temp_dir().join("fluree_binary_cache")
-                                    }),
-                            ),
-                        };
+                        let gc_config = self.gc_config();
                         tokio::spawn(async move {
                             // Hold the permit for the task's lifetime; dropping it
                             // on completion frees a GC slot.
@@ -1564,7 +1711,7 @@ impl BackgroundIndexerWorker {
                         };
                         state.resolve_waiters_below(index_result.index_t, outcome);
                         state.last_index_t = index_result.index_t;
-                        state.recalculate_pending_min_t();
+                        state.recalculate_pending_min_t(self.gc_idle_delay());
                         if state.pending_min_t.is_some() {
                             state.phase = IndexPhase::Pending;
                         }
@@ -2718,6 +2865,85 @@ mod tests {
             busy_cancelled.normalize_orphaned_inprogress(),
             Some(IndexPhase::Idle)
         );
+    }
+
+    /// Delay used by the deferred-idle-GC tests. Value is irrelevant to the
+    /// scheduling logic; only whether a deadline is set at all.
+    const TEST_GC_DELAY: std::time::Duration = std::time::Duration::from_secs(1800);
+
+    #[test]
+    fn going_idle_schedules_one_deferred_gc_pass() {
+        // The gap this closes: GC used to run ONLY after a publish, so a ledger
+        // that finished its work and stopped publishing was never collected again.
+        let mut finishing = LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            ..Default::default()
+        };
+        assert!(finishing.gc_due_at.is_none());
+        finishing.recalculate_pending_min_t(TEST_GC_DELAY);
+        assert_eq!(finishing.phase, IndexPhase::Idle);
+        assert!(
+            finishing.gc_due_at.is_some(),
+            "a ledger going idle must schedule its deferred GC pass"
+        );
+    }
+
+    #[test]
+    fn idle_gc_deadline_is_not_pushed_out_by_repeat_calls() {
+        // A ledger that flaps idle/busy must not accumulate deadlines, nor keep
+        // deferring its own collection every time it briefly goes quiet — which
+        // would reproduce the never-collected bug with extra steps.
+        let mut state = LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            ..Default::default()
+        };
+        state.recalculate_pending_min_t(TEST_GC_DELAY);
+        let first = state.gc_due_at.expect("scheduled");
+
+        // Already idle: no new transition, so no reschedule.
+        state.recalculate_pending_min_t(TEST_GC_DELAY);
+        assert_eq!(state.gc_due_at, Some(first));
+
+        // Busy again, then idle again while the pass is STILL pending: the
+        // original deadline must survive rather than be pushed further out.
+        state.phase = IndexPhase::InProgress;
+        state.recalculate_pending_min_t(TEST_GC_DELAY);
+        assert_eq!(
+            state.gc_due_at,
+            Some(first),
+            "a pending pass must not be rescheduled"
+        );
+    }
+
+    #[test]
+    fn cancelled_ledger_does_not_schedule_idle_gc() {
+        // Cancellation means the run loop will not act on this ledger, and the
+        // firing path re-checks `cancelled` anyway; scheduling would just leave a
+        // deadline waking the loop for work it will immediately discard.
+        let mut cancelled = LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            cancelled: true,
+            ..Default::default()
+        };
+        cancelled.recalculate_pending_min_t(TEST_GC_DELAY);
+        assert_eq!(cancelled.phase, IndexPhase::Idle);
+        assert!(cancelled.gc_due_at.is_none());
+    }
+
+    #[test]
+    fn pending_work_neither_idles_nor_schedules_gc() {
+        // Waiters remain, so the ledger is not quiescent: it will publish again
+        // and get its GC from the normal post-publish path.
+        let (tx, _rx) = oneshot::channel();
+        let mut busy = LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            waiters: vec![(42, tx)],
+            ..Default::default()
+        };
+        busy.recalculate_pending_min_t(TEST_GC_DELAY);
+        assert_eq!(busy.pending_min_t, Some(42));
+        assert_ne!(busy.phase, IndexPhase::Idle);
+        assert!(busy.gc_due_at.is_none());
     }
 
     #[test]
