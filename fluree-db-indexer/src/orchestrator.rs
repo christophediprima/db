@@ -958,12 +958,24 @@ impl BackgroundIndexerWorker {
         // DETACHED: a full prefix listing takes seconds and must never hold the
         // worker loop or this mutex.
         let previous = {
-            let state = self.orphan_state.lock().await;
-            match state.get(ledger_id) {
+            let mut state = self.orphan_state.lock().await;
+            let previous = match state.get(ledger_id) {
                 Some(prev) if now.duration_since(prev.last_run) < interval => return,
                 Some(prev) => prev.candidates.clone(),
                 None => HashSet::new(),
-            }
+            };
+            // Stamp the attempt NOW, before the sweep runs, so the interval is
+            // respected whatever the outcome. Recording it only on success let a
+            // failing sweep retry on every tick — observed in production as the
+            // same unsupported-listing error several times a second.
+            state.insert(
+                ledger_id.to_string(),
+                OrphanSweepState {
+                    last_run: now,
+                    candidates: previous.clone(),
+                },
+            );
+            previous
         };
 
         // Share the GC concurrency cap: both walk chains and hammer storage, so

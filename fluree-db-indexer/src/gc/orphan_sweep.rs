@@ -102,7 +102,14 @@ pub struct OrphanSweepReport {
     /// Confirmed orphans actually released. Always 0 when `delete` is false.
     pub deleted: usize,
     /// Bytes held by this pass's candidates — the size of the problem.
+    ///
+    /// Meaningful only when [`Self::sizes_available`] is true: backends that do not
+    /// implement `list_prefix_with_metadata` report counts but not sizes.
     pub candidate_bytes: u64,
+    /// Whether the backend could report object sizes, i.e. whether
+    /// [`Self::candidate_bytes`] means anything. False on backends that only
+    /// implement the plain `list_prefix`, such as the local filesystem.
+    pub sizes_available: bool,
     /// Set when a guard stopped the sweep. `deleted` is then always 0.
     pub aborted: Option<&'static str>,
 }
@@ -212,21 +219,45 @@ pub async fn sweep_orphans(
     }
 
     // 2. Everything actually on disk under the index prefixes (guard 4).
+    //
+    // `list_prefix_with_metadata` is the nicer call — it carries `size_bytes`, so
+    // the report can say how much space is unreachable — but it is a DEFAULT trait
+    // method that errors "not supported by this storage backend" on backends that
+    // do not override it, the local filesystem among them. So it is opportunistic:
+    // try it for the byte figure, and fall back to the always-implemented
+    // `list_prefix`, reporting counts without bytes rather than failing the sweep.
     let mut candidates: HashSet<String> = HashSet::new();
+    let mut have_sizes = true;
     for prefix in index_prefixes(namespace_id) {
-        let objects = storage.list_prefix_with_metadata(&prefix).await?;
-        for obj in objects {
-            report.listed += 1;
-            let Some(digest) = digest_from_address(&obj.address) else {
-                continue; // not an artifact filename — never a candidate
-            };
-            if !reachable.contains(digest) {
-                report.candidate_bytes += obj.size_bytes;
-                candidates.insert(obj.address);
+        match storage.list_prefix_with_metadata(&prefix).await {
+            Ok(objects) => {
+                for obj in objects {
+                    report.listed += 1;
+                    let Some(digest) = digest_from_address(&obj.address) else {
+                        continue; // not an artifact filename — never a candidate
+                    };
+                    if !reachable.contains(digest) {
+                        report.candidate_bytes += obj.size_bytes;
+                        candidates.insert(obj.address);
+                    }
+                }
+            }
+            Err(_) => {
+                have_sizes = false;
+                for address in storage.list_prefix(&prefix).await? {
+                    report.listed += 1;
+                    let Some(digest) = digest_from_address(&address) else {
+                        continue;
+                    };
+                    if !reachable.contains(digest) {
+                        candidates.insert(address);
+                    }
+                }
             }
         }
     }
     report.candidates = candidates.len();
+    report.sizes_available = have_sizes;
 
     // 3. Guard 2: only orphans seen on two consecutive passes are actionable.
     let confirmed: Vec<&String> = candidates
@@ -357,6 +388,16 @@ mod tests {
             !p.iter().any(|x| x.contains("commit")),
             "commit data must never be in scope"
         );
+    }
+
+    #[test]
+    fn report_defaults_mark_sizes_unavailable() {
+        // `candidate_bytes` is only meaningful when the backend could report sizes.
+        // A default report claiming sizes were available would make 0 bytes look
+        // like "nothing unreachable" rather than "we could not measure".
+        let r = OrphanSweepReport::default();
+        assert!(!r.sizes_available);
+        assert_eq!(r.candidate_bytes, 0);
     }
 
     #[test]
