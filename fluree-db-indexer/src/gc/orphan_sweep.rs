@@ -114,13 +114,17 @@ pub struct OrphanSweepReport {
     pub aborted: Option<&'static str>,
 }
 
-/// Prefixes searched, relative to the namespace. Index artifacts only — guard 4.
+/// Prefixes searched. Index artifacts only — guard 4.
+///
+/// Derived with the SAME helpers `content_path` uses, deliberately: a namespace id
+/// is `ledger:branch`, which maps to `ledger/branch/…`, and dicts live outside the
+/// branch under `ledger/@shared/…`. Hand-rolling this is how the first version
+/// listed zero objects — it produced `ledger:branch/main/index/`, which matches
+/// nothing. Reusing the canonical helpers means the two cannot drift.
 fn index_prefixes(namespace_id: &str) -> Vec<String> {
-    vec![
-        format!("{namespace_id}/main/index/"),
-        // Dicts live outside the branch, shared across it.
-        format!("{namespace_id}/@shared/dicts/"),
-    ]
+    let branch = fluree_db_core::ledger_id_prefix_for_path(namespace_id);
+    let shared = fluree_db_core::address_path::shared_prefix_for_path(namespace_id);
+    vec![format!("{branch}/index/"), format!("{shared}/dicts/")]
 }
 
 /// The hex digest in an object address: the filename stem.
@@ -259,6 +263,28 @@ pub async fn sweep_orphans(
     report.candidates = candidates.len();
     report.sizes_available = have_sizes;
 
+    // Guard 5: the chain references artifacts, so they must BE on disk. Listing
+    // nothing while `reachable > 0` is incoherent — it means the prefixes are wrong
+    // (or listing silently returned empty), not that the ledger is empty.
+    //
+    // Added because exactly that happened: the first deployed version built its
+    // prefixes by hand, produced `ledger:branch/main/index/`, and reported
+    // `listed=0 reachable=4052`. Nothing was deleted — an object that is never
+    // listed can never become a candidate, so a wrong prefix can only ever
+    // under-collect — but it looked like a clean sweep of a tidy ledger, which is
+    // the most misleading result this code could produce. Fail loudly instead.
+    if report.listed == 0 {
+        report.aborted = Some("listed nothing while the chain references artifacts");
+        tracing::warn!(
+            namespace_id,
+            reachable = report.reachable,
+            prefixes = ?index_prefixes(namespace_id),
+            "Orphan sweep aborted: listing returned no objects but the chain \
+             references artifacts — check the storage prefixes"
+        );
+        return Ok((report, HashSet::new()));
+    }
+
     // 3. Guard 2: only orphans seen on two consecutive passes are actionable.
     let confirmed: Vec<&String> = candidates
         .iter()
@@ -377,17 +403,45 @@ mod tests {
         assert_eq!(kind_from_address("ns/main/commit/x.fcv2"), None);
     }
 
+    /// Prefixes must match what `content_path` actually writes.
+    ///
+    /// The first deployed version hand-rolled these as `{namespace_id}/main/…`,
+    /// which for the real id `ledger:branch` produced `ledger:branch/main/index/`
+    /// and listed **zero** objects on a ledger holding thousands. Pin the real
+    /// shape: `ledger:branch` → `ledger/branch/index/`, dicts under
+    /// `ledger/@shared/dicts/`.
     #[test]
-    fn prefixes_cover_index_and_shared_dicts_only() {
-        let p = index_prefixes("led");
-        assert!(p.contains(&"led/main/index/".to_string()));
-        assert!(p.contains(&"led/@shared/dicts/".to_string()));
+    fn prefixes_match_the_real_address_layout() {
+        let p = index_prefixes("mydb:main");
+        assert!(
+            p.contains(&"mydb/main/index/".to_string()),
+            "branch prefix wrong: {p:?}"
+        );
+        assert!(
+            p.contains(&"mydb/@shared/dicts/".to_string()),
+            "shared dict prefix wrong: {p:?}"
+        );
+        // The ':' must never survive into a prefix — that was the bug.
+        assert!(
+            !p.iter().any(|x| x.contains(':')),
+            "a ':' in a prefix matches nothing: {p:?}"
+        );
         // Guard 4: commit data is never listed, so it can never be deleted even
         // if the reachable set is wrong.
         assert!(
             !p.iter().any(|x| x.contains("commit")),
             "commit data must never be in scope"
         );
+    }
+
+    /// A non-default branch must also resolve correctly, not just `main`.
+    #[test]
+    fn prefixes_respect_a_non_default_branch() {
+        let p = index_prefixes("mydb:feature-x");
+        assert!(p.contains(&"mydb/feature-x/index/".to_string()), "{p:?}");
+        // Dicts are shared ACROSS branches, so they stay on the ledger, not the
+        // branch — getting this wrong would sweep another branch's dictionaries.
+        assert!(p.contains(&"mydb/@shared/dicts/".to_string()), "{p:?}");
     }
 
     #[test]
