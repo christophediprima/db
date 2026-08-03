@@ -51,7 +51,7 @@ use fluree_db_nameservice::{
     IndexingNameService, LedgerEventBus, NameServiceEvent, SubscriptionScope,
 };
 use futures::FutureExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -835,10 +835,27 @@ pub struct BackgroundIndexerWorker {
     /// reached — safe because GC re-scans the full prev-index chain on every
     /// run, so a skipped pass is reattempted after the next successful index.
     gc_semaphore: Arc<Semaphore>,
+    /// Per-ledger orphan-sweep state: rate-limit clock plus the previous pass's
+    /// candidate set for two-pass confirmation.
+    orphan_state: Arc<Mutex<HashMap<String, OrphanSweepState>>>,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
 const MAX_CONCURRENT_GC: usize = 4;
+
+/// Per-ledger orphan-sweep bookkeeping.
+///
+/// Held in memory rather than persisted: after a restart the confirmation simply
+/// re-primes, which is strictly more conservative than trusting a stale on-disk
+/// candidate list, and there is no format to version.
+#[derive(Debug)]
+struct OrphanSweepState {
+    /// When the last sweep ran, for rate limiting.
+    last_run: tokio::time::Instant,
+    /// Addresses that looked unreferenced last time. Deletion requires an address
+    /// to appear here AND in the current pass — see `gc::orphan_sweep`.
+    candidates: HashSet<String>,
+}
 
 /// Margin added to the deferred idle-GC delay.
 ///
@@ -884,6 +901,7 @@ impl BackgroundIndexerWorker {
             subscriber_trigger: trigger,
             event_bus: None,
             gc_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GC)),
+            orphan_state: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (worker, handle)
@@ -913,6 +931,105 @@ impl BackgroundIndexerWorker {
     fn gc_idle_delay(&self) -> std::time::Duration {
         std::time::Duration::from_secs(u64::from(self.config.gc_min_time_mins) * 60)
             + GC_IDLE_DELAY_MARGIN
+    }
+
+    /// Run an orphan sweep for a ledger, if one is due.
+    ///
+    /// Chain GC reclaims only what the prev-index chain can still reach, so an
+    /// artifact that has fallen off the chain is unreclaimable by any retention
+    /// setting. This closes that — but it lists every object under the ledger's
+    /// index prefixes (~100k on a large ledger), so it is rate-limited per ledger
+    /// rather than run on every GC pass.
+    ///
+    /// Skipped entirely when the backend cannot list (`Permanent` stores expose no
+    /// admin storage) or when the interval is 0.
+    async fn spawn_orphan_sweep_if_due(&self, ledger_id: &str) {
+        let interval_mins = self.config.gc_orphan_sweep_interval_mins;
+        if interval_mins == 0 {
+            return;
+        }
+        let Some(storage) = self.backend.admin_storage_cloned() else {
+            return; // Permanent backends expose no listing surface
+        };
+
+        let interval = std::time::Duration::from_secs(u64::from(interval_mins) * 60);
+        let now = tokio::time::Instant::now();
+        // Due-check and previous candidate set under one short lock. The sweep runs
+        // DETACHED: a full prefix listing takes seconds and must never hold the
+        // worker loop or this mutex.
+        let previous = {
+            let state = self.orphan_state.lock().await;
+            match state.get(ledger_id) {
+                Some(prev) if now.duration_since(prev.last_run) < interval => return,
+                Some(prev) => prev.candidates.clone(),
+                None => HashSet::new(),
+            }
+        };
+
+        // Share the GC concurrency cap: both walk chains and hammer storage, so
+        // they should contend for one budget rather than add a second.
+        let Ok(permit) = Arc::clone(&self.gc_semaphore).try_acquire_owned() else {
+            return;
+        };
+
+        // Resolve the published index head — no fresh build result to take it from.
+        let root_id = match self.nameservice.lookup(ledger_id).await {
+            Ok(Some(record)) => record.index_head_id,
+            _ => None,
+        };
+        let Some(root_id) = root_id else {
+            return; // nothing published yet, so nothing to sweep
+        };
+
+        let store = self.backend.content_store(ledger_id);
+        let config = crate::gc::OrphanSweepConfig {
+            artifact_cache_dir: self.gc_config().artifact_cache_dir,
+            delete: self.config.gc_orphan_delete,
+            ..Default::default()
+        };
+        let state_handle = Arc::clone(&self.orphan_state);
+        let ledger = ledger_id.to_string();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            match crate::gc::sweep_orphans(
+                store.as_ref(),
+                storage.as_ref(),
+                &ledger,
+                &root_id,
+                &previous,
+                &config,
+            )
+            .await
+            {
+                Ok((report, candidates)) => {
+                    state_handle.lock().await.insert(
+                        ledger.clone(),
+                        OrphanSweepState {
+                            last_run: now,
+                            candidates,
+                        },
+                    );
+                    // INFO whenever anything is unreferenced: this is the only
+                    // number that reveals unreachable bytes, and it stayed invisible
+                    // for as long as nothing reported it.
+                    if report.candidates > 0 || report.aborted.is_some() {
+                        info!(
+                            ledger_id = %ledger,
+                            listed = report.listed,
+                            reachable = report.reachable,
+                            candidates = report.candidates,
+                            candidate_bytes = report.candidate_bytes,
+                            confirmed = report.confirmed,
+                            deleted = report.deleted,
+                            aborted = ?report.aborted,
+                            "Orphan sweep"
+                        );
+                    }
+                }
+                Err(e) => warn!(ledger_id = %ledger, error = %e, "Orphan sweep failed (non-fatal)"),
+            }
+        });
     }
 
     /// Run one deferred GC pass for a ledger that has gone idle.
@@ -1108,6 +1225,20 @@ impl BackgroundIndexerWorker {
             };
             for ledger_id in &gc_due {
                 self.spawn_idle_gc(ledger_id).await;
+            }
+
+            // Orphan sweeps for every known ledger, busy or idle. Rate-limited
+            // internally to `gc_orphan_sweep_interval_mins`, so calling this on
+            // every tick is cheap — the due-check is one map lookup — and it does
+            // not depend on a ledger going quiet, which a continuously-fed ledger
+            // never does. Chain GC cannot see off-chain artifacts at all, so
+            // without this their space is unreclaimable by any retention setting.
+            let known: Vec<String> = {
+                let states = self.states.lock().await;
+                states.keys().cloned().collect()
+            };
+            for ledger_id in &known {
+                self.spawn_orphan_sweep_if_due(ledger_id).await;
             }
 
             debug!(

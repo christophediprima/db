@@ -1923,6 +1923,33 @@ impl FlureeBuilder {
         self
     }
 
+    /// Configure the orphan sweep, which reclaims index artifacts no retained
+    /// index version references. `None` leaves either setting at its default.
+    ///
+    /// Chain GC reclaims only what the prev-index chain can still reach, so
+    /// off-chain artifacts are unreclaimable by any retention setting; this is the
+    /// only thing that recovers them. `delete` is off by default because deletion
+    /// is by non-reachability — see `fluree_db_indexer::gc::OrphanSweepConfig`.
+    pub fn with_orphan_sweep(mut self, interval_mins: Option<u32>, delete: Option<bool>) -> Self {
+        let existing = self.indexing_config.take();
+        let index_config = existing
+            .as_ref()
+            .map(|c| c.index_config.clone())
+            .unwrap_or_else(server_defaults::default_index_config);
+        let mut indexer_config = existing.map(|c| c.indexer_config).unwrap_or_default();
+        if let Some(v) = interval_mins {
+            indexer_config.gc_orphan_sweep_interval_mins = v;
+        }
+        if let Some(v) = delete {
+            indexer_config.gc_orphan_delete = v;
+        }
+        self.indexing_config = Some(IndexingBuilderConfig {
+            indexer_config,
+            index_config,
+        });
+        self
+    }
+
     /// Set novelty backpressure thresholds without enabling background indexing.
     ///
     /// Use this for short-lived processes (CLI, one-shot scripts) that need

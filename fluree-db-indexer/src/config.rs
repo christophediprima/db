@@ -194,6 +194,26 @@ pub struct IndexerConfig {
     /// trade-off this accepts.
     pub gc_hard_max_old_indexes: Option<u32>,
 
+    /// Minimum minutes between orphan sweeps for one ledger. `0` disables.
+    ///
+    /// Chain GC reclaims only what the prev-index chain can still see, so an
+    /// artifact that has fallen off the chain is unreachable and unreclaimable by
+    /// any retention setting. The sweep closes that, but it lists every object
+    /// under the ledger's index prefixes — ~100k objects on a large ledger — so it
+    /// is rate-limited rather than run on every GC pass.
+    ///
+    /// Default 60. Since deletion additionally requires two-pass confirmation, the
+    /// first sweep after a start-up only ever reports; the earliest anything is
+    /// deleted is one interval later.
+    pub gc_orphan_sweep_interval_mins: u32,
+
+    /// Let the orphan sweep DELETE confirmed orphans rather than only report them.
+    ///
+    /// Off by default: deleting by non-reachability is the most destructive
+    /// operation in this crate, so a deployment's first experience of it should be
+    /// a report it can check against `du`.
+    pub gc_orphan_delete: bool,
+
     /// Memory budget (bytes) for the run-sort buffer during index building.
     ///
     /// This total is split evenly across all sort orders (SPOT, PSOT, POST, OPST).
@@ -408,6 +428,8 @@ impl Default for IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             gc_hard_max_old_indexes: None,
+            gc_orphan_sweep_interval_mins: 60,
+            gc_orphan_delete: false,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -445,6 +467,8 @@ impl IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             gc_hard_max_old_indexes: None,
+            gc_orphan_sweep_interval_mins: 60,
+            gc_orphan_delete: false,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -475,6 +499,8 @@ impl IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             gc_hard_max_old_indexes: None,
+            gc_orphan_sweep_interval_mins: 60,
+            gc_orphan_delete: false,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -505,6 +531,8 @@ impl IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             gc_hard_max_old_indexes: None,
+            gc_orphan_sweep_interval_mins: 60,
+            gc_orphan_delete: false,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,

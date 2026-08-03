@@ -538,6 +538,10 @@ async fn build_direct_fluree(
                 config.gc_max_old_indexes,
                 config.gc_min_time_mins,
                 config.gc_hard_max_old_indexes,
+            )
+            .with_orphan_sweep(
+                config.gc_orphan_sweep_interval_mins,
+                config.gc_orphan_delete,
             );
     } else {
         // Peer / external-indexer mode: skip spawning a background

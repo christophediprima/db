@@ -443,6 +443,25 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_GC_HARD_MAX_OLD_INDEXES")]
     pub gc_hard_max_old_indexes: Option<u32>,
 
+    /// Minutes between orphan sweeps per ledger; 0 disables (default 60)
+    ///
+    /// Chain GC only reclaims what the prev-index chain can still reach, so
+    /// artifacts that have fallen off the chain are unreclaimable by any retention
+    /// setting. The sweep closes that, but it lists every object under a ledger's
+    /// index prefixes, so it is rate-limited rather than run every GC pass.
+    #[arg(long, env = "FLUREE_GC_ORPHAN_SWEEP_INTERVAL_MINS")]
+    pub gc_orphan_sweep_interval_mins: Option<u32>,
+
+    /// Let the orphan sweep DELETE what it finds, rather than only reporting it
+    ///
+    /// Off by default: deletion is by non-reachability, the most destructive
+    /// operation in the indexer, so the first thing a deployment should get is a
+    /// report it can check against actual disk usage. Deletion additionally
+    /// requires two-pass confirmation, so nothing is removed until an artifact has
+    /// looked unreferenced across two sweeps.
+    #[arg(long, env = "FLUREE_GC_ORPHAN_DELETE")]
+    pub gc_orphan_delete: Option<bool>,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -837,6 +856,8 @@ impl Default for ServerConfig {
             gc_max_old_indexes: None,
             gc_min_time_mins: None,
             gc_hard_max_old_indexes: None,
+            gc_orphan_sweep_interval_mins: None,
+            gc_orphan_delete: None,
             cache_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
