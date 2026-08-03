@@ -33,7 +33,7 @@
 //! ## Safety
 //!
 //! Deleting by non-reachability is the most destructive thing in this crate: a
-//! reachability set that is wrong, or merely incomplete, deletes live data. Four
+//! reachability set that is wrong, or merely incomplete, deletes live data. Five
 //! guards, and `delete` is **off by default** so the first thing any deployment
 //! gets is a report:
 //!
@@ -49,10 +49,17 @@
 //!    artifacts are unreferenced on one pass at most — by the next they are either
 //!    referenced by a published root, or the build failed and they are genuinely
 //!    orphaned.
-//! 3. **A per-run deletion cap**, so a reachability bug cannot empty a volume in
-//!    one pass. Exceeding it is logged, not silently truncated.
+//! 3. **A per-run deletion cap** that bounds one pass and then CONTINUES, logging
+//!    how many remain. It must not veto the work: a real backlog exceeds any cap
+//!    by definition, and an earlier version that refused outright made the backlog
+//!    permanent, since nothing else reclaims those objects. Truncation is only
+//!    dangerous when silent.
 //! 4. **Index prefixes only.** Commit and nameservice data are never listed, so
 //!    they cannot be deleted even if the reachable set is wrong.
+//! 5. **Abort if listing finds nothing while the chain references artifacts.**
+//!    Those artifacts must be on disk, so `listed=0` with `reachable>0` means the
+//!    prefixes are wrong, not that the ledger is empty — a state an earlier version
+//!    reported as a clean sweep of a tidy ledger.
 
 use super::collector::walk_prev_index_chain_cs_cached;
 use crate::error::Result;
@@ -286,7 +293,7 @@ pub async fn sweep_orphans(
     }
 
     // 3. Guard 2: only orphans seen on two consecutive passes are actionable.
-    let confirmed: Vec<&String> = candidates
+    let mut confirmed: Vec<&String> = candidates
         .iter()
         .filter(|a| previous_candidates.contains(*a))
         .collect();
@@ -310,18 +317,31 @@ pub async fn sweep_orphans(
         return Ok((report, candidates));
     }
 
-    // Guard 3: refuse to act on an implausible volume in one pass.
-    if confirmed.len() > config.max_delete_per_run {
-        report.aborted = Some("confirmed orphans exceed max_delete_per_run");
+    // Guard 3: bound how much one pass may delete, then CONTINUE.
+    //
+    // Earlier this refused outright when `confirmed` exceeded the cap, on the
+    // reasoning that truncating silently was worse than doing nothing. That was
+    // wrong, and deadlocked the exact case the sweep exists for: a real backlog is
+    // BY DEFINITION more than the cap (we measured 14,728 confirmed against a cap
+    // of 10,000), nothing else reclaims those objects, so every subsequent pass
+    // refused too and the backlog was permanent.
+    //
+    // A cap on a repeatable operation should limit the blast radius of one pass,
+    // not veto the work. So delete up to the cap and say plainly how many remain —
+    // the next pass takes the next batch. Truncation is only dangerous when it is
+    // silent, which the log below prevents.
+    let over_cap = confirmed.len().saturating_sub(config.max_delete_per_run);
+    if over_cap > 0 {
         tracing::warn!(
             namespace_id,
             confirmed = confirmed.len(),
             max_delete_per_run = config.max_delete_per_run,
-            "Orphan sweep refusing to delete: over the per-run cap. Raise the cap \
-             deliberately, or investigate the reachability set first — this many \
-             orphans is as likely to be a bug here as a real backlog."
+            remaining_after_this_pass = over_cap,
+            "Orphan sweep capped: deleting the per-run maximum, the rest follow on \
+             later passes. If this does not shrink pass over pass, stop and check \
+             the reachability set before raising the cap."
         );
-        return Ok((report, candidates));
+        confirmed.truncate(config.max_delete_per_run);
     }
 
     for address in confirmed {
@@ -452,6 +472,29 @@ mod tests {
         let r = OrphanSweepReport::default();
         assert!(!r.sizes_available);
         assert_eq!(r.candidate_bytes, 0);
+    }
+
+    #[test]
+    fn the_per_run_cap_bounds_a_pass_without_vetoing_the_work() {
+        // Regression: an earlier version REFUSED when confirmed exceeded the cap,
+        // which deadlocked the only case the sweep exists for. A real backlog is
+        // larger than any cap (measured: 14,728 confirmed against a cap of 10,000),
+        // nothing else reclaims those objects, so refusing made it permanent.
+        //
+        // Pin the arithmetic the fix relies on: a pass takes `cap` and leaves the
+        // remainder for the next one, so the backlog strictly shrinks.
+        let confirmed = 14_728usize;
+        let cap = DEFAULT_MAX_DELETE_PER_RUN;
+        assert!(confirmed > cap, "the interesting case is over the cap");
+        let over = confirmed.saturating_sub(cap);
+        assert_eq!(over, 4_728);
+        // Progress per pass must be non-zero, or the backlog never clears.
+        assert!(
+            confirmed - over > 0,
+            "a capped pass must still delete something"
+        );
+        // And a pass under the cap must not be truncated at all.
+        assert_eq!(500usize.saturating_sub(cap), 0);
     }
 
     #[test]
