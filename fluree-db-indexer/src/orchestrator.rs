@@ -896,6 +896,10 @@ impl BackgroundIndexerWorker {
         crate::gc::CleanGarbageConfig {
             max_old_indexes: Some(self.config.gc_max_old_indexes),
             min_time_garbage_mins: Some(self.config.gc_min_time_mins),
+            // `None` takes the derived default (`max_old_indexes * 4`). Not yet
+            // surfaced on `IndexerConfig`, so background GC cannot tune it — API
+            // consumers that build `CleanGarbageConfig` directly still can.
+            hard_max_old_indexes: None,
             artifact_cache_dir: Some(
                 self.config
                     .data_dir
