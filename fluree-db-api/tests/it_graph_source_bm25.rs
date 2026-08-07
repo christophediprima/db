@@ -1715,3 +1715,109 @@ async fn scoped_indexing_query_narrows_the_indexed_scan() {
          scoped {scoped_work} vs full {full_work} (fuel above the query floor)"
     );
 }
+
+/// `--no-track` has to reach the persisted record, not just the in-memory
+/// config: the maintenance worker reads the flag off the nameservice, so a
+/// create path that drops it silently re-enables maintenance.
+#[tokio::test]
+async fn create_persists_the_tracked_flag_on_the_graph_source_record() {
+    for tracked in [true, false] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = "bm25/tracked:main";
+        let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+        let tx = json!({
+            "@context": { "ex":"http://example.org/" },
+            "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Hello world" }]
+        });
+        fluree.insert(ledger0, &tx).await.unwrap();
+
+        let query = json!({
+            "@context": { "ex":"http://example.org/" },
+            "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+            "select": { "?x": ["@id", "ex:title"] }
+        });
+
+        let cfg = Bm25CreateConfig::new("tracked-search", ledger_id, query).with_tracked(tracked);
+        let created = fluree.create_full_text_index(cfg).await.unwrap();
+
+        let record = fluree
+            .nameservice()
+            .lookup_graph_source(&created.graph_source_id)
+            .await
+            .unwrap()
+            .expect("graph source record");
+
+        assert_eq!(
+            fluree_db_api::bm25_tracked(&record),
+            tracked,
+            "create must persist tracked={tracked} where the worker reads it"
+        );
+    }
+}
+
+/// Flipping the flag must not disturb the rest of the config, or an untrack
+/// would quietly change how the index is built on its next sync.
+#[tokio::test]
+async fn set_bm25_tracked_flips_only_the_flag() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "bm25/settrack:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Hello world" }]
+    });
+    fluree.insert(ledger0, &tx).await.unwrap();
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("settrack-search", ledger_id, query.clone())
+        .with_k1(1.7)
+        .with_b(0.3);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+    let gs_id = created.graph_source_id.clone();
+
+    let before = fluree
+        .nameservice()
+        .lookup_graph_source(&gs_id)
+        .await
+        .unwrap()
+        .expect("record");
+    let before_cfg: serde_json::Value = serde_json::from_str(&before.config).unwrap();
+
+    let was = fluree.set_bm25_tracked(&gs_id, false).await.unwrap();
+    assert!(was, "an index created without --no-track starts tracked");
+
+    let after = fluree
+        .nameservice()
+        .lookup_graph_source(&gs_id)
+        .await
+        .unwrap()
+        .expect("record");
+    let after_cfg: serde_json::Value = serde_json::from_str(&after.config).unwrap();
+
+    assert!(!fluree_db_api::bm25_tracked(&after), "the flag flipped");
+    for key in ["k1", "b", "query"] {
+        assert_eq!(
+            after_cfg.get(key),
+            before_cfg.get(key),
+            "{key} must survive a tracking change"
+        );
+    }
+    assert_eq!(
+        after.dependencies, before.dependencies,
+        "dependencies must survive a tracking change"
+    );
+    assert_eq!(
+        after.index_t, before.index_t,
+        "the index watermark must survive a tracking change"
+    );
+
+    // Idempotent, and reports the value it found.
+    assert!(!fluree.set_bm25_tracked(&gs_id, false).await.unwrap());
+    assert!(!fluree.set_bm25_tracked(&gs_id, true).await.unwrap());
+    assert!(fluree.set_bm25_tracked(&gs_id, true).await.unwrap());
+}
