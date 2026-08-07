@@ -241,16 +241,14 @@ BM25 and vector indexes are created via the Rust API. See [BM25](bm25.md) and [V
 
 ### Updating Indexes
 
-BM25 indexes are **not** automatically updated when the source ledger changes. They must be explicitly synced:
+By default a BM25 index is not updated when its source ledger changes; it must be explicitly synced:
 
 ```rust
 // Incremental sync (detects changes since last watermark)
 let result = fluree.sync_bm25_index("products-search:main").await?;
-
-// Or use the Bm25MaintenanceWorker for automatic background syncing
 ```
 
-The `Bm25MaintenanceWorker` can be configured to watch for ledger commits and sync automatically.
+Or start the server with `--bm25-auto-sync` and it runs a `Bm25MaintenanceWorker` that syncs each index as its source ledger commits. Individual indexes can opt out with `fluree bm25 create --no-track` or `fluree bm25 untrack`; see [Background Maintenance](#background-maintenance).
 
 ### Deleting Indexes
 
@@ -439,10 +437,14 @@ println!("Index at t={}, ledger at t={}, stale: {}, lag: {}",
 
 ### Background Maintenance
 
-The `Bm25MaintenanceWorker` watches for source ledger commits and syncs indexes automatically:
+Started by `--bm25-auto-sync` (off by default), the `Bm25MaintenanceWorker` watches for source ledger commits and syncs indexes automatically:
 - Debounces rapid commits (configurable interval)
-- Bounded concurrency for concurrent sync operations
+- Bounded concurrency, and at most one sync in flight per index
 - Registers/unregisters graph sources dynamically
+- Adopts indexes that already exist at startup, and catches up any already behind their source
+- Skips indexes marked untracked, so one expensive index can be exempted without turning auto-sync off everywhere
+
+Each sync re-runs the indexing query over the whole source ledger, so its cost tracks corpus size rather than commit size. See [BM25 → Background Maintenance Worker](bm25.md#background-maintenance-worker).
 
 ## Best Practices
 

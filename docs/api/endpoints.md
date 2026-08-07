@@ -1624,7 +1624,7 @@ A flat array of ledgers and graph sources. Retracted entries are omitted.
   {"name": "mydb", "branch": "main", "type": "Ledger", "t": 5},
   {"name": "mydb", "branch": "dev", "type": "Ledger", "t": 3},
   {"name": "docsearch", "branch": "main", "type": "BM25", "t": 5,
-   "dependencies": ["mydb:main"]},
+   "dependencies": ["mydb:main"], "tracked": true},
   {"name": "warehouse", "branch": "main", "type": "Iceberg", "t": 0,
    "dependencies": ["mydb:main"]}
 ]
@@ -1637,8 +1637,11 @@ A flat array of ledgers and graph sources. Retracted entries are omitted.
 | `type` | `Ledger`, or the graph-source family: `BM25`, `Vector`, `Geo`, `R2RML`, `Iceberg` |
 | `t` | Commit `t` for a ledger; the index watermark for a graph source |
 | `dependencies` | Source ledger aliases a graph source derives from. Omitted for ledgers. |
+| `tracked` | Whether a server running with `--bm25-auto-sync` keeps this index fresh. BM25 entries only; omitted for everything else. |
 
 `dependencies` is what lets a client pair a graph source against its source's `t` from this one response — the staleness check behind `fluree bm25 list`. A dependency alias may omit the branch, in which case `main` is implied.
+
+`tracked` is here for the same reason: without it `fluree bm25 list` could not show the flag over HTTP, and an index nothing maintains would read as healthy. A server predating the field omits it, and clients should treat its absence as unknown rather than as untracked.
 
 **Example:**
 
@@ -2911,6 +2914,75 @@ Two errors that are the caller's fault currently come back as `500` with `"@type
 By default the server does not sync on commit, so an index only advances when something calls this endpoint — run it from a maintenance job, using `fluree bm25 list --stale` to enumerate the indexes whose source has moved past their watermark. Starting the server with `--bm25-auto-sync` (env `FLUREE_BM25_AUTO_SYNC`, or `indexing.bm25_auto_sync` in the config file) instead keeps every index current automatically, syncing each one when its source ledger commits.
 
 See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
+
+### POST {api_base_url}/bm25/track
+### POST {api_base_url}/bm25/untrack
+
+Set whether the maintenance worker keeps one index fresh. Admin-protected; forwarded to the transaction server in peer mode.
+
+`--bm25-auto-sync` is a per-deployment switch: with it on, every live BM25 index re-syncs whenever its source ledger commits. These endpoints carve out exceptions, so a corpus whose sync is too expensive to run per commit can be left to a scheduled job without turning auto-sync off for everything else.
+
+**URL:**
+```
+POST {api_base_url}/bm25/track
+POST {api_base_url}/bm25/untrack
+```
+
+**Request Body:**
+```json
+{ "index": "docsearch:main" }
+```
+
+**Response:**
+```json
+{
+  "graph_source_id": "docsearch:main",
+  "tracked": false,
+  "was_tracked": true,
+  "registered": false
+}
+```
+
+- `tracked` — the flag's value now. Persisted on the graph-source record, so it survives a restart and is visible to any process reading the nameservice.
+- `was_tracked` — what it was before, so a no-op call is distinguishable.
+- `registered` — whether the *answering node's* worker is maintaining the index as of this response. `tracked: true` with `registered: false` means the flag was recorded but no worker runs here; see `--bm25-auto-sync`.
+
+Neither endpoint syncs. Use [`POST /bm25/sync`](#post-api_base_urlbm25sync) to advance an index.
+
+**Status Codes:**
+- `200 OK` — flag set (including when it was already that value)
+- `400 Bad Request` — `index` missing or empty
+- `401/403` — admin auth required
+- `404 Not Found` — no such index
+
+An index created before this flag existed reads as tracked, so an upgrade does not silently stop maintaining anything.
+
+See also the CLI equivalents: [fluree bm25 track / untrack](../cli/bm25.md#fluree-bm25-track--fluree-bm25-untrack).
+
+### GET {api_base_url}/bm25/tracking
+
+Report the maintenance worker running in the answering process. Admin-protected, and deliberately **not** leader-forwarded — the answer is about the node that was asked.
+
+**URL:**
+```
+GET {api_base_url}/bm25/tracking
+```
+
+**Response:**
+```json
+{
+  "running": true,
+  "indexes": ["docsearch:main"],
+  "watched_ledgers": ["docs:main"],
+  "syncs_performed": 12,
+  "syncs_failed": 0,
+  "events_received": 34
+}
+```
+
+`running: false` is a normal answer, not an error: it means this node runs no worker, which is what a durable `tracked: true` that never advances looks like from the outside.
+
+This reports worker state only. For per-index staleness use [`GET /ledgers`](#get-api_base_urlledgers), which carries each index's `t` (its watermark) alongside its source ledger's `t`, plus a `tracked` field for BM25 entries — everything the staleness comparison needs from one response.
 
 ## Admin Endpoints
 
