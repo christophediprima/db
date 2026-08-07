@@ -56,6 +56,7 @@ pub use telemetry::{init_logging, shutdown_tracer, TelemetryConfig};
 use axum::Router;
 use fluree_db_api::{bm25_tracked, Bm25MaintenanceWorker, Bm25WorkerHandle, Fluree};
 use fluree_db_nameservice::GraphSourceRecord;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Whether this process runs a Raft node.
@@ -111,13 +112,60 @@ pub fn indexes_to_auto_sync(records: &[GraphSourceRecord]) -> Vec<&GraphSourceRe
         .collect()
 }
 
+/// A source ledger's current commit `t`.
+///
+/// A stored dependency alias may omit the branch — `create_bm25_index` records
+/// `Bm25CreateConfig::ledger` verbatim, and a bare `name` means `name:main` —
+/// while ledger records are keyed `name:branch`. So try the alias as it was
+/// stored before assuming `:main`, the same fallback `fluree bm25 list` uses.
+fn source_commit_t(commit_t: &HashMap<String, i64>, source: &str) -> Option<i64> {
+    commit_t
+        .get(source)
+        .or_else(|| commit_t.get(&format!("{source}:main")))
+        .copied()
+}
+
+/// Of the indexes being registered, those whose source has already committed
+/// past their watermark.
+///
+/// Registration alone only reacts to *future* commits, so an index that fell
+/// behind while the server was down would stay behind until something happened
+/// to commit to its source again — on a quiet ledger, indefinitely.
+///
+/// An index whose source ledger cannot be resolved is left alone: that is a
+/// dropped or renamed ledger, and syncing against it would only fail.
+pub fn indexes_needing_catch_up<'a>(
+    indexes: &[&'a GraphSourceRecord],
+    commit_t: &HashMap<String, i64>,
+) -> Vec<&'a GraphSourceRecord> {
+    indexes
+        .iter()
+        .filter(|gs| {
+            gs.dependencies
+                .first()
+                .and_then(|source| source_commit_t(commit_t, source))
+                .is_some_and(|ledger_t| gs.index_t < ledger_t)
+        })
+        .copied()
+        .collect()
+}
+
 /// Build a BM25 maintenance worker seeded with the indexes that already exist.
 ///
 /// `auto_register` only picks up indexes created while the worker is running,
 /// so without this pass an index created before startup would never sync.
 /// Failing to enumerate is not fatal: those indexes stay unregistered until
 /// their next config publish, and ones created from here on still register.
-async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25WorkerHandle) {
+///
+/// Indexes already behind their source are queued for an immediate catch-up.
+/// Both facts come from records already read here — each index carries its
+/// `index_t` and each ledger its `commit_t` — so this costs one extra
+/// nameservice listing, not one read per index.
+///
+/// Public so a test can boot a worker the way the server does. `run()` owns
+/// the spawn, so without this the registration and catch-up passes could only
+/// be exercised by binding a port and racing shutdown.
+pub async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25WorkerHandle) {
     let worker = Bm25MaintenanceWorker::new(Arc::clone(&fluree));
     let handle = worker.handle();
 
@@ -127,7 +175,37 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
             for gs in &indexes {
                 handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
             }
-            info!(registered = indexes.len(), "BM25 auto-sync starting");
+
+            // Catch-up is best-effort: failing to list ledgers costs the
+            // catch-up, not the registration, so the worker still starts.
+            let behind = match fluree.nameservice().all_records().await {
+                Ok(ledgers) => {
+                    let commit_t: HashMap<String, i64> = ledgers
+                        .iter()
+                        .filter(|r| !r.retracted)
+                        .map(|r| (format!("{}:{}", r.name, r.branch), r.commit_t))
+                        .collect();
+                    let behind = indexes_needing_catch_up(&indexes, &commit_t);
+                    for gs in &behind {
+                        handle.request_sync(&gs.graph_source_id);
+                    }
+                    behind.len()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to list ledgers for BM25 catch-up; indexes already \
+                         behind will wait for their next source commit"
+                    );
+                    0
+                }
+            };
+
+            info!(
+                registered = indexes.len(),
+                catching_up = behind,
+                "BM25 auto-sync starting"
+            );
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to enumerate BM25 indexes for auto-sync");
@@ -1337,6 +1415,80 @@ mod tests {
         let records = vec![record("legacy", GraphSourceType::Bm25)];
 
         assert_eq!(indexes_to_auto_sync(&records).len(), 1);
+    }
+
+    fn indexed(name: &str, index_t: i64, source: &str) -> GraphSourceRecord {
+        GraphSourceRecord {
+            index_t,
+            dependencies: vec![source.to_string()],
+            ..record(name, GraphSourceType::Bm25)
+        }
+    }
+
+    fn commits(pairs: &[(&str, i64)]) -> HashMap<String, i64> {
+        pairs
+            .iter()
+            .map(|(alias, t)| ((*alias).to_string(), *t))
+            .collect()
+    }
+
+    /// Registration only reacts to future commits, so an index that fell
+    /// behind while the server was down would stay behind until its source
+    /// happened to commit again — on a quiet ledger, indefinitely.
+    #[test]
+    fn catch_up_selects_indexes_behind_their_source() {
+        let behind = indexed("stale", 5, "docs:main");
+        let current = indexed("fresh", 9, "docs:main");
+        let ahead = indexed("ahead", 12, "docs:main");
+        let indexes = vec![&behind, &current, &ahead];
+
+        let selected: Vec<&str> = indexes_needing_catch_up(&indexes, &commits(&[("docs:main", 9)]))
+            .iter()
+            .map(|gs| gs.graph_source_id.as_str())
+            .collect();
+
+        assert_eq!(
+            selected,
+            vec!["stale:main"],
+            "only an index whose source has moved past its watermark needs one"
+        );
+    }
+
+    /// Same branchless-alias hazard as the worker's map keys: the dependency
+    /// is stored verbatim, the ledger record is keyed `name:branch`.
+    #[test]
+    fn catch_up_resolves_a_branchless_dependency_alias() {
+        let behind = indexed("stale", 1, "docs");
+        let indexes = vec![&behind];
+
+        assert_eq!(
+            indexes_needing_catch_up(&indexes, &commits(&[("docs:main", 7)])).len(),
+            1,
+            "a bare `docs` dependency must resolve against the `docs:main` record"
+        );
+    }
+
+    /// An unresolvable source is a dropped or renamed ledger. Syncing against
+    /// it can only fail, so it is left alone rather than queued.
+    #[test]
+    fn catch_up_skips_an_index_whose_source_is_gone() {
+        let orphan = indexed("orphan", 1, "vanished:main");
+        let indexes = vec![&orphan];
+
+        assert!(indexes_needing_catch_up(&indexes, &commits(&[("docs:main", 7)])).is_empty());
+    }
+
+    /// An index with no recorded dependency has nothing to compare against.
+    #[test]
+    fn catch_up_skips_an_index_with_no_dependency() {
+        let no_deps = GraphSourceRecord {
+            index_t: 1,
+            dependencies: vec![],
+            ..record("nodeps", GraphSourceType::Bm25)
+        };
+        let indexes = vec![&no_deps];
+
+        assert!(indexes_needing_catch_up(&indexes, &commits(&[("docs:main", 7)])).is_empty());
     }
 
     /// The slot must not outlive the worker. Losing Raft leadership aborts the

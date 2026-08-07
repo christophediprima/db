@@ -187,3 +187,35 @@ async fn dropped_indexes_are_not_registered() {
         "the dropped index should not be eligible for registration: {live:?}"
     );
 }
+
+/// An index that fell behind while the server was down must catch up when it
+/// comes back, with nobody committing to wake it. Registration alone only
+/// reacts to future commits, so on a quiet ledger this is the difference
+/// between "current shortly after boot" and "stale indefinitely".
+#[tokio::test]
+async fn a_stale_index_catches_up_at_startup_without_a_commit() {
+    let (_tmp, state) = test_state(true).await;
+    let gs_id = seed(&state).await;
+
+    // Commit past the index while nothing is maintaining it — the state a
+    // restart finds after writes landed with the worker down.
+    insert_doc(&state, "ex:doc2", "Rust ownership").await;
+    let stale_at = index_watermark(&state, &gs_id).await;
+    let ledger_t = state.fluree.ledger("docs:main").await.expect("ledger").t();
+    assert!(
+        stale_at < ledger_t,
+        "precondition: the index should be behind ({stale_at} vs {ledger_t})"
+    );
+
+    // Boot the worker the way the server does, catch-up pass included.
+    let (worker, _handle) = fluree_db_server::build_bm25_worker(Arc::clone(&state.fluree)).await;
+    let task = tokio::spawn(async move { worker.run().await });
+
+    let caught_up = await_watermark_past(&state, &gs_id, stale_at).await;
+
+    assert!(
+        caught_up >= ledger_t,
+        "the index should have caught up to {ledger_t}, got {caught_up}"
+    );
+    task.abort();
+}
