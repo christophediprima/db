@@ -163,6 +163,119 @@ pub struct MaterializeResult {
     pub tally: TargetTally,
 }
 
+/// Which tenants this process owns, when the deployment is sharded across several
+/// Fluree instances.
+///
+/// Sharding is the only lever that multiplies WRITE capacity — writes are single-leader
+/// per ledger, so more writers means disjoint ledger sets on separate instances. But the
+/// materialize worker resolves a row's target template AFTER reading the row, so without
+/// an ownership check every shard reads every row and calls `create_ledger` for EVERY
+/// target. The worker actively destroys the disjointness sharding depends on.
+///
+/// # Why this is not an Iceberg scan filter
+///
+/// The scan can take an `Expression` and `arrow_reader` does exact row filtering — so
+/// pushing `tenant_id IN (...)` down looks like the obvious fix. It is not SOUND for
+/// correctness:
+///
+/// * `collect_and_comparisons` builds a row filter only from `Comparison` and `And`.
+///   `In`/`NotIn` are deliberately transparent, and its own comment states the row filter
+///   "may only ever keep MORE rows than the true predicate" — file/row-group pruning and
+///   the in-engine FILTER "stay the authority". A lone `In` yields NO row filter.
+/// * The whole path is gated by `FLUREE_ICEBERG_PREDICATE_PUSHDOWN`, so flipping one env
+///   var off would silently destroy shard disjointness.
+///
+/// So correctness lives here, in the worker, and the scan filter is an OPTIMISATION only
+/// (prune files and row-groups, where `In` is fully supported and sound). Same config can
+/// drive both; each is used where it is valid.
+///
+/// # Why the column value, and not the resolved ledger name
+///
+/// Matching a prefix of the expanded target (`silver_acme_`) looks simpler and has a trap:
+/// a tenant id containing the separator (`acme_eu`) expands to `silver_acme_eu_u1`, which
+/// prefix-matches tenant `acme`. Cross-tenant leakage from a string coincidence is the
+/// worst failure available here, so ownership is decided on the SHARD KEY COLUMN's exact
+/// value before any template expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardOwnership {
+    /// Source column identifying the shard key (e.g. `tenant_id`).
+    pub key_column: String,
+    /// The exact key values this process owns. A row whose key is absent is skipped.
+    pub owned: std::collections::BTreeSet<String>,
+}
+
+impl ShardOwnership {
+    /// Whether this process owns `row`. A row missing the shard-key column, or holding a
+    /// NULL there, is NOT owned: it cannot be attributed to a shard, and guessing would
+    /// mean two shards both claiming it (duplicate writes) or neither (silent data loss).
+    pub fn owns_row(&self, batch: &ColumnBatch, row: usize) -> bool {
+        match column_string(batch, &self.key_column, row) {
+            Some(key) => self.owned.contains(key.as_str()),
+            None => false,
+        }
+    }
+}
+
+/// This process's shard ownership, read once from the environment.
+///
+/// `FLUREE_MATERIALIZE_SHARD_KEY` names the source column (e.g. `tenant_id`) and
+/// `FLUREE_MATERIALIZE_SHARD_VALUES` is the comma-separated set this process owns. Both
+/// must be set; either alone is a misconfiguration and is IGNORED with a warning rather
+/// than half-applied, because a half-applied shard filter either drops everything or
+/// nothing and both look like a working deployment.
+///
+/// Unset (the default) means unsharded: every row is owned, exactly as before.
+///
+/// An explicit owned-set rather than a hash of the key, because rebalancing is occasional
+/// and deliberate: hash-mod cannot move ONE tenant without rehashing every other, and
+/// cannot express "move tenant X to shard 2" at all. The cost of an explicit set is that
+/// the two shards' configs must be edited together during a move — an auditable,
+/// reviewable step, which is what you want for something whose failure mode is
+/// cross-tenant leakage.
+fn env_shard_ownership() -> Option<&'static ShardOwnership> {
+    static OWNERSHIP: std::sync::OnceLock<Option<ShardOwnership>> = std::sync::OnceLock::new();
+    OWNERSHIP
+        .get_or_init(|| {
+            let key = std::env::var("FLUREE_MATERIALIZE_SHARD_KEY").ok();
+            let values = std::env::var("FLUREE_MATERIALIZE_SHARD_VALUES").ok();
+            match (key, values) {
+                (Some(key), Some(values)) if !key.trim().is_empty() => {
+                    let owned: std::collections::BTreeSet<String> = values
+                        .split(',')
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .collect();
+                    if owned.is_empty() {
+                        warn!(
+                            "FLUREE_MATERIALIZE_SHARD_VALUES is set but empty; running UNSHARDED \
+                             (every row owned). Set it to a comma-separated key list or unset it."
+                        );
+                        return None;
+                    }
+                    info!(
+                        shard_key = %key.trim(),
+                        owned_keys = owned.len(),
+                        "materialize: sharded — rows whose shard key is not owned are skipped"
+                    );
+                    Some(ShardOwnership {
+                        key_column: key.trim().to_string(),
+                        owned,
+                    })
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    warn!(
+                        "FLUREE_MATERIALIZE_SHARD_KEY and FLUREE_MATERIALIZE_SHARD_VALUES must \
+                         BOTH be set; only one is. Running UNSHARDED — a half-applied shard \
+                         filter would drop either everything or nothing and still look healthy."
+                    );
+                    None
+                }
+                _ => None,
+            }
+        })
+        .as_ref()
+}
+
 /// The source side of a materialize pass: what the mapping is, how to interpret it, and
 /// one window of rows.
 ///
@@ -286,6 +399,7 @@ impl Fluree {
             force_full,
             // Production always derives its own transaction budget.
             None,
+            env_shard_ownership(),
         )
         .await
     }
@@ -311,6 +425,7 @@ impl Fluree {
         target_ledger_id: &str,
         force_full: bool,
         txn_budget_override: Option<usize>,
+        shard: Option<&ShardOwnership>,
     ) -> Result<MaterializeResult> {
         // 1. Compiled R2RML mapping (subject / predicate / object maps) and the
         //    materialization options (delete convention + latest-by-key ordering).
@@ -355,6 +470,7 @@ impl Fluree {
 
         let mut accum = MaterializeAccum::default();
         let mut rows_read = 0usize;
+        let mut rows_not_owned = 0usize;
         let mut incremental_all = true;
         let mut any_table = false;
         // Set when at least one table's window has aged past the refresh bound, so a
@@ -440,6 +556,15 @@ impl Fluree {
                 }
                 for row in 0..batch.num_rows {
                     rows_read += 1;
+                    // SHARD BOUNDARY. Checked before template expansion, on the shard
+                    // key's exact value — see `ShardOwnership` for why not a prefix of
+                    // the expanded target, and why not the Iceberg scan filter.
+                    if let Some(shard) = shard {
+                        if !shard.owns_row(batch, row) {
+                            rows_not_owned += 1;
+                            continue;
+                        }
+                    }
                     // Resolve this row's TARGET ledger. A placeholder-free target
                     // is used verbatim for every row (plain single-target job); a
                     // templated target (e.g. `silver_{tenant_id}_{user_id}:main`)
@@ -613,6 +738,7 @@ impl Fluree {
                 targets_ok = tally.ok,
                 targets_deferred = tally.deferred,
                 targets_failed = tally.failed,
+                rows_not_owned,
                 "materialize: partial window"
             );
         }
@@ -2751,7 +2877,7 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
             .await
             .expect("materialize");
 
@@ -2793,7 +2919,7 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
             .await
             .expect("materialize");
 
@@ -2820,7 +2946,14 @@ mod engine_tests {
             src.window_age_ms = age;
 
             let result = fluree
-                .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+                .materialize_from_source(
+                    &src,
+                    "people:main",
+                    "people_native:main",
+                    false,
+                    None,
+                    None,
+                )
                 .await
                 .expect("materialize");
 
@@ -2851,7 +2984,14 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_{tenant}:main", false, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
             .await
             .expect("materialize");
 
@@ -2901,7 +3041,14 @@ mod engine_tests {
             let fluree = FlureeBuilder::memory().build_memory();
             let src = FakeSource::new(people_mapping(), vec![batch(&rows)]);
             let result = fluree
-                .materialize_from_source(&src, "people:main", "people_native:main", false, budget)
+                .materialize_from_source(
+                    &src,
+                    "people:main",
+                    "people_native:main",
+                    false,
+                    budget,
+                    None,
+                )
                 .await
                 .expect("materialize");
             assert_eq!(
@@ -2923,6 +3070,213 @@ mod engine_tests {
              unbounded reached t={unbounded}, budget=200B reached t={chunked} — chunking \
              is not happening at the call site"
         );
+    }
+
+    /// Sharding, the whole point of it: a shard writes ONLY its own tenants.
+    ///
+    /// Without this check every shard reads every row and calls `create_ledger` for every
+    /// target, so N shards each build all N tenants' ledgers — the worker destroys the
+    /// disjointness that sharding exists to create.
+    #[tokio::test]
+    async fn a_shard_writes_only_the_tenants_it_owns() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2", "3"]),
+                ("name", &["alice", "bob", "carol"]),
+                ("tenant", &["acme", "globex", "acme"]),
+            ])],
+        );
+        let shard = ShardOwnership {
+            key_column: "tenant".into(),
+            owned: ["acme".to_string()].into_iter().collect(),
+        };
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                Some(&shard),
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.tally,
+            TargetTally {
+                ok: 1,
+                deferred: 0,
+                failed: 0
+            },
+            "only acme's ledger may be touched — a globex ledger here means this shard \
+             created another shard's target"
+        );
+        assert_eq!(
+            result.subjects_upserted, 2,
+            "acme's two rows, not globex's one"
+        );
+        assert_eq!(
+            result.rows_read, 3,
+            "all three rows are still READ; ownership is a filter"
+        );
+    }
+
+    /// A row whose shard key is NULL belongs to NO shard.
+    ///
+    /// The shard key here is `region`, deliberately NOT a template column. My first
+    /// version of this test used the template column itself and was VACUOUS: a NULL
+    /// template column already fails `resolve_target_ledger`, so the row was skipped
+    /// downstream whatever ownership decided, and mutating `None => true` left it green.
+    /// Mutation testing caught that. When the shard key is independent of the template the
+    /// row IS routable, so this branch is the only thing that can skip it.
+    ///
+    /// Skipping is the only sound answer: claiming it in every shard duplicates writes,
+    /// and claiming it in the "first" shard is order-dependent. Both alternatives differ
+    /// per shard, which is precisely what sharding must not do.
+    #[tokio::test]
+    async fn a_row_with_a_null_shard_key_belongs_to_no_shard() {
+        let fields = vec![
+            FieldInfo {
+                name: "id".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "tenant".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+            FieldInfo {
+                name: "region".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 4,
+            },
+        ];
+        let cols = vec![
+            Column::String(vec![Some("1".into()), Some("2".into())]),
+            Column::String(vec![Some("alice".into()), Some("bob".into())]),
+            // BOTH rows route fine — tenant is never null — so only ownership can skip one.
+            Column::String(vec![Some("acme".into()), Some("acme".into())]),
+            Column::String(vec![Some("eu".into()), None]),
+        ];
+        let b = ColumnBatch::new(Arc::new(BatchSchema::new(fields)), cols).expect("batch");
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(people_mapping(), vec![b]);
+        let shard = ShardOwnership {
+            key_column: "region".into(),
+            owned: ["eu".to_string()].into_iter().collect(),
+        };
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                Some(&shard),
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.subjects_upserted, 1,
+            "the region=eu row is owned; the region=NULL row is routable but unattributable \
+             and must be skipped rather than claimed"
+        );
+        assert_eq!(
+            result.rows_read, 2,
+            "both rows were read — ownership is a filter, not a scan"
+        );
+    }
+
+    /// An unknown shard key is skipped too — a key this process does not own is not this
+    /// process's work, whether it belongs to a sibling shard or to no shard at all.
+    #[tokio::test]
+    async fn a_row_with_an_unowned_shard_key_is_skipped() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2"]),
+                ("name", &["alice", "bob"]),
+                ("tenant", &["acme", "acme"]),
+                ("region", &["eu", "us"]),
+            ])],
+        );
+        let shard = ShardOwnership {
+            key_column: "region".into(),
+            owned: ["eu".to_string()].into_iter().collect(),
+        };
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                Some(&shard),
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.subjects_upserted, 1,
+            "region=us belongs to another shard and must not be written here"
+        );
+    }
+
+    /// Unsharded (`None`) must behave exactly as before sharding existed. This is the
+    /// regression guard for every existing single-instance deployment.
+    #[tokio::test]
+    async fn no_shard_config_owns_every_row() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2"]),
+                ("name", &["alice", "bob"]),
+                ("tenant", &["acme", "globex"]),
+            ])],
+        );
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.tally,
+            TargetTally {
+                ok: 2,
+                deferred: 0,
+                failed: 0
+            },
+            "unsharded means both tenants are this process's work"
+        );
+        assert_eq!(result.subjects_upserted, 2);
     }
 
     /// A row whose template column is NULL cannot be routed anywhere, so it is skipped
@@ -2960,7 +3314,14 @@ mod engine_tests {
         let src = FakeSource::new(people_mapping(), vec![b]);
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_{tenant}:main", false, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
             .await
             .expect("materialize");
 
