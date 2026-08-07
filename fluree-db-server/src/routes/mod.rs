@@ -94,6 +94,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // graph-source fallbacks in `/ledgers`, `/info`, and `/drop`.
         .route("/bm25/create", post(bm25::bm25_create))
         .route("/bm25/sync", post(bm25::bm25_sync))
+        // Tracking flips a flag on the graph-source record, so it publishes
+        // through the same path and belongs on the leader for the same reason.
+        .route("/bm25/track", post(bm25::bm25_track))
+        .route("/bm25/untrack", post(bm25::bm25_untrack))
         // Wholesale .flpack restore: creates a new ledger from a trusted
         // archive. Writes prebuilt index artifacts, so admin-gated.
         .route("/import/*ledger", post(import::import_ledger_tail))
@@ -143,7 +147,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/export/*ledger", post(export::export_ledger_tail))
         // Status of a negotiated upload — reads this node's
         // `state.import_jobs` map (each node owns the jobs it minted).
-        .route("/import-upload/:import_id", get(import::import_status));
+        .route("/import-upload/:import_id", get(import::import_status))
+        // Which BM25 indexes *this* node's maintenance worker has adopted.
+        // Per-node ephemeral state like import status, so it must not be
+        // leader-forwarded: the answer is about the node that was asked.
+        .route("/bm25/tracking", get(bm25::bm25_tracking));
 
     // Read-only Iceberg catalog browse / metadata preview. POSTs (the inline
     // connection carries a secret in the body) but they mutate nothing and

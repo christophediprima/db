@@ -467,6 +467,56 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
                     }
                 }
             },
+            "/v1/fluree/bm25/track": {
+                "post": {
+                    "summary": "Resume automatic maintenance of a BM25 index",
+                    "description": "Sets the index's persisted `tracked` flag, so a server running with `--bm25-auto-sync` re-syncs it whenever its source ledger commits, and registers it with this node's worker immediately. The flag is durable and survives a restart.",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "index": {
+                                            "type": "string",
+                                            "description": "Index graph-source alias (e.g. \"docsearch:main\")"
+                                        }
+                                    },
+                                    "required": ["index"]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/bm25/untrack": {
+                "post": {
+                    "summary": "Stop automatically maintaining a BM25 index",
+                    "description": "Clears the index's persisted `tracked` flag, exempting it from `--bm25-auto-sync` without turning auto-sync off for the rest of the deployment. The index is left in place and can still be advanced with POST /v1/fluree/bm25/sync.",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "index": {
+                                            "type": "string",
+                                            "description": "Index graph-source alias (e.g. \"docsearch:main\")"
+                                        }
+                                    },
+                                    "required": ["index"]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/bm25/tracking": {
+                "get": {
+                    "summary": "Report the BM25 maintenance worker running in this process",
+                    "description": "Whether a worker is running on the answering node, which indexes it has adopted, and its cumulative sync counters. Per-node state, so it is not leader-forwarded. For per-index staleness use GET /v1/fluree/ledgers, which carries each index's index_t alongside its source ledger's commit_t."
+                }
+            },
             "/v1/fluree/query": {
                 "post": {
                     "summary": "Execute a query",

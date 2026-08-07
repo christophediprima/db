@@ -28,6 +28,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Where the running BM25 maintenance worker publishes its handle so request
+/// handlers can reach it.
+///
+/// Shared by `Arc` rather than owned outright by [`AppState`]: the Raft
+/// leader-watcher closure needs to fill this slot, and it is constructed
+/// before the state is wrapped in an `Arc`.
+pub type Bm25WorkerSlot = Arc<parking_lot::Mutex<Option<fluree_db_api::Bm25WorkerHandle>>>;
+
 /// Application state shared across all request handlers
 ///
 /// Uses `Arc<AppState>` for sharing across handlers via axum's State extractor.
@@ -101,6 +109,21 @@ pub struct AppState {
     /// Handle for the background leaflet cache stats logger task.
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// The BM25 maintenance worker running in this process, once one has been
+    /// started. Late-bound on purpose: `FlureeServer::run` owns the spawn and
+    /// picks an owner per deployment (`bm25_worker_owner`), which happens well
+    /// after this `AppState` is behind an `Arc`. Under Raft the worker starts
+    /// and stops with leadership, so this is a slot that gets cleared and
+    /// refilled — not a `OnceLock`.
+    ///
+    /// Separately `Arc`ed rather than reached through the `AppState` so the
+    /// Raft leader-watcher closure can hold it: that closure is built before
+    /// the state is wrapped, and capturing the state itself would be a cycle.
+    ///
+    /// `None` means no worker on this node: `--bm25-auto-sync` is off, this is
+    /// a peer, or this node is not the Raft leader.
+    bm25_worker: Bm25WorkerSlot,
 
     /// Registry of in-flight negotiated-upload import jobs (reference impl of
     /// the presigned `.flpack` upload flow). Empty/unused unless
@@ -289,6 +312,7 @@ impl AppState {
             query_refresh_last_checked: DashMap::new(),
             serving_posture_cache: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
+            bm25_worker: Bm25WorkerSlot::default(),
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
             #[cfg(feature = "aws")]
             storage_vend_scope,
@@ -339,6 +363,20 @@ impl AppState {
     /// Get server uptime in seconds
     pub fn uptime_secs(&self) -> u64 {
         self.start_time.elapsed().as_secs()
+    }
+
+    /// The slot the running BM25 maintenance worker publishes itself into.
+    /// Handed to whichever path spawns the worker.
+    pub fn bm25_worker_slot(&self) -> Bm25WorkerSlot {
+        Arc::clone(&self.bm25_worker)
+    }
+
+    /// The BM25 maintenance worker on this node, if one is running.
+    ///
+    /// Returns a clone rather than a guard so callers never hold the lock
+    /// across an await.
+    pub fn bm25_worker(&self) -> Option<fluree_db_api::Bm25WorkerHandle> {
+        self.bm25_worker.lock().clone()
     }
 
     /// Subscribe to ledger/graph-source change events via the event bus.
