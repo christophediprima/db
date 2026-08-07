@@ -2745,6 +2745,29 @@ impl RemoteLedgerClient {
         )
         .await
     }
+
+    /// Set whether a BM25 index is kept fresh automatically.
+    ///
+    /// Calls `POST {base_url}/bm25/track` or `…/bm25/untrack`.
+    pub async fn bm25_set_tracked(
+        &self,
+        index: &str,
+        tracked: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(if tracked {
+            "bm25/track"
+        } else {
+            "bm25/untrack"
+        });
+        let body = serde_json::json!({ "index": index });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
 }
 
 fn push_idempotency_key(ledger: &str, request: &fluree_db_api::PushCommitsRequest) -> String {

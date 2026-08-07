@@ -46,6 +46,7 @@ pub async fn run(action: Bm25Action, dirs: &FlureeDir, direct: bool) -> CliResul
             query_file,
             k1,
             b,
+            no_track,
             remote,
         } => {
             let args = CreateArgs {
@@ -56,6 +57,7 @@ pub async fn run(action: Bm25Action, dirs: &FlureeDir, direct: bool) -> CliResul
                 query_file,
                 k1,
                 b,
+                tracked: !no_track,
             };
             run_create(args, dirs, remote.as_deref(), direct).await
         }
@@ -67,8 +69,16 @@ pub async fn run(action: Bm25Action, dirs: &FlureeDir, direct: bool) -> CliResul
         Bm25Action::Sync { index, t, remote } => {
             run_sync(&index, t, dirs, remote.as_deref(), direct).await
         }
-        Bm25Action::List { stale, remote } => {
-            run_list(stale, dirs, remote.as_deref(), direct).await
+        Bm25Action::List {
+            stale,
+            untracked,
+            remote,
+        } => run_list(stale, untracked, dirs, remote.as_deref(), direct).await,
+        Bm25Action::Track { index, remote } => {
+            run_set_tracked(&index, true, dirs, remote.as_deref(), direct).await
+        }
+        Bm25Action::Untrack { index, remote } => {
+            run_set_tracked(&index, false, dirs, remote.as_deref(), direct).await
         }
     }
 }
@@ -117,6 +127,9 @@ struct CreateArgs {
     query_file: Option<std::path::PathBuf>,
     k1: Option<f64>,
     b: Option<f64>,
+    /// Whether a server running with `--bm25-auto-sync` should keep this index
+    /// fresh. `false` is `--no-track`.
+    tracked: bool,
 }
 
 /// One row of `bm25 list`: an index paired with the source ledger it covers.
@@ -128,6 +141,9 @@ struct IndexRow {
     /// `None` when the source ledger could not be resolved — it may have been
     /// dropped out from under the index.
     ledger_t: Option<i64>,
+    /// Whether a maintenance worker keeps this index fresh. `None` when the
+    /// server did not report it — a server predating the flag.
+    tracked: Option<bool>,
 }
 
 impl IndexRow {
@@ -139,6 +155,12 @@ impl IndexRow {
 
     fn alias(&self) -> String {
         format!("{}:{}", self.name, self.branch)
+    }
+
+    /// Whether nothing is keeping this index fresh. An unreported flag is not
+    /// evidence of either state, so it does not count as untracked.
+    fn is_untracked(&self) -> bool {
+        self.tracked == Some(false)
     }
 }
 
@@ -159,6 +181,7 @@ fn resolve_source_t(commit_t: &HashMap<String, i64>, source: &str) -> Option<i64
 /// ledger's commit `t` has advanced past the index's watermark (`index_t`).
 async fn run_list(
     stale_only: bool,
+    untracked_only: bool,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     direct: bool,
@@ -177,7 +200,7 @@ async fn run_list(
     };
     rows.sort_by(|a, b| (&a.name, &a.branch).cmp(&(&b.name, &b.branch)));
 
-    render_index_rows(&rows, stale_only);
+    render_index_rows(&rows, stale_only, untracked_only);
     Ok(())
 }
 
@@ -204,6 +227,7 @@ async fn local_index_rows(dirs: &FlureeDir) -> CliResult<Vec<IndexRow>> {
                 ledger_t: resolve_source_t(&commit_t, &source),
                 source,
                 index_t: gs.index_t,
+                tracked: Some(fluree_db_api::bm25_tracked(gs)),
             }
         })
         .collect();
@@ -293,19 +317,26 @@ fn remote_index_rows(entries: &serde_json::Value) -> Vec<IndexRow> {
                 ledger_t: resolve_source_t(&commit_t, &source),
                 source,
                 index_t: t_of(e).unwrap_or_default(),
+                tracked: e.get("tracked").and_then(serde_json::Value::as_bool),
             }
         })
         .collect()
 }
 
-fn render_index_rows(rows: &[IndexRow], stale_only: bool) {
+fn render_index_rows(rows: &[IndexRow], stale_only: bool, untracked_only: bool) {
     use comfy_table::{ContentArrangement, Table};
 
-    // Script-friendly mode: just the stale indexes, one alias per line, so a
-    // maintenance loop can do: `for i in $(fluree bm25 list --stale); do
-    // fluree bm25 sync --index "$i"; done`.
-    if stale_only {
-        for row in rows.iter().filter(|r| r.is_stale()) {
+    // Script-friendly mode: matching aliases, one per line, so a maintenance
+    // loop can do: `for i in $(fluree bm25 list --stale --untracked); do
+    // fluree bm25 sync --index "$i"; done`. The two filters compose, and
+    // together they name exactly the set nothing else is keeping fresh —
+    // `--stale` alone over-reports once a worker owns most indexes.
+    if stale_only || untracked_only {
+        for row in rows
+            .iter()
+            .filter(|r| !stale_only || r.is_stale())
+            .filter(|r| !untracked_only || r.is_untracked())
+        {
             println!("{}", row.alias());
         }
         return;
@@ -326,6 +357,7 @@ fn render_index_rows(rows: &[IndexRow], stale_only: bool) {
         "INDEX_T",
         "LEDGER_T",
         "STALE",
+        "TRACKED",
     ]);
     for row in rows {
         let index_t = if row.index_t > 0 {
@@ -343,9 +375,24 @@ fn render_index_rows(rows: &[IndexRow], stale_only: bool) {
             index_t,
             ledger_t,
             if row.is_stale() { "YES" } else { "no" }.to_string(),
+            // Casing follows STALE: the value worth noticing is the shouted
+            // one. Here that is NO — an index nothing maintains.
+            match row.tracked {
+                Some(true) => "yes",
+                Some(false) => "NO",
+                None => "-",
+            }
+            .to_string(),
         ]);
     }
     println!("{table}");
+
+    if rows.iter().any(IndexRow::is_untracked) {
+        println!(
+            "\n  TRACKED=NO: exempt from --bm25-auto-sync. Advance these with \
+             'fluree bm25 sync', or re-enable with 'fluree bm25 track'."
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -384,8 +431,9 @@ async fn run_create(
         return print_remote_create(&result);
     }
 
-    let mut config =
-        Bm25CreateConfig::new(&args.name, &args.ledger, query).with_branch(&args.branch);
+    let mut config = Bm25CreateConfig::new(&args.name, &args.ledger, query)
+        .with_branch(&args.branch)
+        .with_tracked(args.tracked);
     if let Some(k1) = args.k1 {
         config = config.with_k1(k1);
     }
@@ -408,6 +456,63 @@ async fn run_create(
 
 /// Body for `POST /bm25/create`, mirroring `Bm25CreateConfig`'s optional fields
 /// so the server applies the same defaults the local path would.
+/// Flip whether a maintenance worker keeps an index fresh.
+///
+/// Over a server this also tells that node's worker immediately, so the change
+/// takes effect without waiting for it to observe its own config event. Under
+/// `--direct` only the persisted flag moves — any running server picks it up
+/// from the event, or at its next start-up pass.
+async fn run_set_tracked(
+    index: &str,
+    tracked: bool,
+    dirs: &FlureeDir,
+    remote_flag: Option<&str>,
+    direct: bool,
+) -> CliResult<()> {
+    let verb = if tracked { "track" } else { "untrack" };
+
+    if let Some(client) = resolve_client(dirs, remote_flag, direct).await? {
+        let response = client
+            .bm25_set_tracked(index, tracked)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to {verb} index: {e}")))?;
+        persist_tokens(&client, remote_flag, dirs).await;
+
+        let registered = response
+            .get("registered")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        report_tracking_change(index, tracked, registered);
+        return Ok(());
+    }
+
+    let fluree = build_fluree(dirs)?;
+    fluree
+        .set_bm25_tracked(index, tracked)
+        .await
+        .map_err(CliError::Api)?;
+    report_tracking_change(index, tracked, false);
+    Ok(())
+}
+
+/// Say what changed, and — when it is the surprising case — what still has to
+/// happen for the index to actually advance.
+fn report_tracking_change(index: &str, tracked: bool, registered: bool) {
+    if tracked {
+        println!("Tracking {index} for automatic maintenance.");
+        if !registered {
+            println!(
+                "  Note: no maintenance worker is running on the server that answered. \
+                 Start one with --bm25-auto-sync, or keep advancing this index with \
+                 'fluree bm25 sync'."
+            );
+        }
+    } else {
+        println!("Stopped tracking {index}; it is now exempt from --bm25-auto-sync.");
+        println!("  Advance it with 'fluree bm25 sync' when you want it current.");
+    }
+}
+
 fn create_request_body(args: &CreateArgs, query: &serde_json::Value) -> serde_json::Value {
     let mut body = serde_json::json!({
         "name": args.name,
@@ -420,6 +525,11 @@ fn create_request_body(args: &CreateArgs, query: &serde_json::Value) -> serde_js
     }
     if let Some(b) = args.b {
         body["b"] = serde_json::json!(b);
+    }
+    // Only when opting out: a server predating the flag would reject an
+    // unknown field, and `true` is its default anyway.
+    if !args.tracked {
+        body["tracked"] = serde_json::json!(false);
     }
     body
 }
@@ -605,7 +715,50 @@ mod tests {
             query_file: None,
             k1: None,
             b: None,
+            tracked: true,
         }
+    }
+
+    fn row(name: &str, index_t: i64, ledger_t: Option<i64>, tracked: Option<bool>) -> IndexRow {
+        IndexRow {
+            name: name.to_string(),
+            branch: "main".to_string(),
+            source: "docs:main".to_string(),
+            index_t,
+            ledger_t,
+            tracked,
+        }
+    }
+
+    /// `--no-track` is the whole point of the flag; it has to reach the wire.
+    #[test]
+    fn create_body_carries_tracked_only_when_opting_out() {
+        let query = json!({"select": {"?x": ["@id"]}});
+
+        let body = create_request_body(&args(), &query);
+        assert!(
+            body.get("tracked").is_none(),
+            "the default must not be sent: a server predating the flag would \
+             reject an unknown field"
+        );
+
+        let opted_out = CreateArgs {
+            tracked: false,
+            ..args()
+        };
+        assert_eq!(
+            create_request_body(&opted_out, &query)["tracked"],
+            json!(false)
+        );
+    }
+
+    /// An unreported flag is not evidence of either state — a server predating
+    /// it must not make every index look unmaintained.
+    #[test]
+    fn an_unreported_flag_is_not_untracked() {
+        assert!(!row("a", 1, Some(1), None).is_untracked());
+        assert!(!row("a", 1, Some(1), Some(true)).is_untracked());
+        assert!(row("a", 1, Some(1), Some(false)).is_untracked());
     }
 
     /// The body has to match `Bm25CreateRequest` field-for-field, or the server

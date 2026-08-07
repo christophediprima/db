@@ -447,6 +447,14 @@ pub struct ListEntry {
     /// the staleness check behind `fluree bm25 list` — from this one response.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    /// Whether a server running with `--bm25-auto-sync` keeps this index
+    /// fresh. BM25 entries only; absent for everything else.
+    ///
+    /// Here for the same reason `dependencies` is: without it `fluree bm25
+    /// list` cannot show the flag on its default server-routed path, and an
+    /// index nothing maintains would read as healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked: Option<bool>,
 }
 
 /// List all ledgers and graph sources
@@ -479,6 +487,7 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
             entry_type: "Ledger".to_string(),
             t: r.commit_t,
             dependencies: Vec::new(),
+            tracked: None,
         });
     }
 
@@ -492,6 +501,7 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
             entry_type: fluree_db_api::ledger_info::graph_source_type_label(&gs.source_type),
             t: gs.index_t,
             dependencies: gs.dependencies.clone(),
+            tracked: gs.is_bm25().then(|| fluree_db_api::bm25_tracked(gs)),
         });
     }
 
