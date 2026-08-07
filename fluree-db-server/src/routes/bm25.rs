@@ -39,6 +39,9 @@ pub struct Bm25CreateRequest {
     pub k1: Option<f64>,
     /// BM25 b (document-length normalization, 0..=1). Defaults to 0.75.
     pub b: Option<f64>,
+    /// Whether a server running with `--bm25-auto-sync` keeps this index
+    /// fresh. Defaults to `true`; `false` is `fluree bm25 create --no-track`.
+    pub tracked: Option<bool>,
 }
 
 /// Response for `POST /v1/fluree/bm25/create`
@@ -134,9 +137,13 @@ fn build_bm25_config(req: Bm25CreateRequest) -> Bm25CreateConfig {
         query,
         k1,
         b,
+        tracked,
     } = req;
 
     let mut config = Bm25CreateConfig::new(name, ledger, query);
+    if let Some(tracked) = tracked {
+        config = config.with_tracked(tracked);
+    }
     if let Some(branch) = branch {
         config = config.with_branch(branch);
     }

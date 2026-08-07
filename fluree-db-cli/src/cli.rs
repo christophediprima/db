@@ -1310,6 +1310,14 @@ pub enum Bm25Action {
         #[arg(long)]
         b: Option<f64>,
 
+        /// Exempt this index from `--bm25-auto-sync`, so a server never
+        /// re-syncs it on a source commit. Use for a point-in-time snapshot,
+        /// or an index too expensive to rebuild per commit — a sync re-runs
+        /// the indexing query over the whole source ledger. Advance it with
+        /// `fluree bm25 sync`, or re-enable with `fluree bm25 track`.
+        #[arg(long = "no-track")]
+        no_track: bool,
+
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
@@ -1364,6 +1372,42 @@ pub enum Bm25Action {
         /// Print only stale indexes, one alias per line (script-friendly).
         #[arg(long)]
         stale: bool,
+
+        /// Print only indexes exempt from `--bm25-auto-sync`, one alias per
+        /// line. Composes with `--stale`: together they name exactly the set
+        /// nothing is keeping fresh, which is what a sync job should walk.
+        #[arg(long)]
+        untracked: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Resume automatic maintenance of a BM25 index.
+    ///
+    /// Sets the index's persisted `tracked` flag, so a server running with
+    /// `--bm25-auto-sync` re-syncs it whenever its source ledger commits. The
+    /// flag lives on the index, so it survives a restart.
+    Track {
+        /// Index graph-source alias (e.g. "silver-search:main").
+        #[arg(long)]
+        index: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Stop automatically maintaining a BM25 index.
+    ///
+    /// Exempts one index from `--bm25-auto-sync` without turning auto-sync off
+    /// for the rest of the deployment. The index is left in place and still
+    /// answers queries; advance it with `fluree bm25 sync`.
+    Untrack {
+        /// Index graph-source alias (e.g. "silver-search:main").
+        #[arg(long)]
+        index: String,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
