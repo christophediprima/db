@@ -1821,3 +1821,112 @@ async fn set_bm25_tracked_flips_only_the_flag() {
     assert!(!fluree.set_bm25_tracked(&gs_id, true).await.unwrap());
     assert!(fluree.set_bm25_tracked(&gs_id, true).await.unwrap());
 }
+
+/// Flipping `tracked` on a live index has to reach a running worker. The
+/// config event carries no config, so the worker has to re-read the record —
+/// registering straight off the event would re-adopt an index the operator
+/// just opted out of.
+#[tokio::test]
+async fn a_running_worker_drops_an_index_that_becomes_untracked() {
+    use fluree_db_api::Bm25MaintenanceWorker;
+    use std::sync::Arc;
+
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    let ledger_id = "bm25/reconcile:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Hello world" }]
+    });
+    fluree.insert(ledger0, &tx).await.unwrap();
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("reconcile-search", ledger_id, query))
+        .await
+        .unwrap();
+    let gs_id = created.graph_source_id.clone();
+
+    let worker = Bm25MaintenanceWorker::new(Arc::clone(&fluree));
+    let handle = worker.handle();
+    // `Bm25WorkerHandle::register_graph_source` takes `N: NameServiceLookup +
+    // GraphSourcePublisher + Sized`, which `Fluree::nameservice()` (a
+    // `&dyn NameServiceLookup`) cannot satisfy — so seed it the same way the
+    // server's startup pass does, from the record.
+    let record = fluree
+        .nameservice()
+        .lookup_graph_source(&gs_id)
+        .await
+        .unwrap()
+        .expect("record");
+    handle.register_graph_source_with_deps(&record.graph_source_id, &record.dependencies);
+    assert_eq!(handle.registered_graph_sources(), vec![gs_id.clone()]);
+
+    let task = tokio::spawn(async move { worker.run().await });
+
+    // The bus only delivers to receivers that already exist, and `run()`
+    // subscribes inside the spawned task. Publishing before that lands would
+    // be a silently missed event, so handshake first: commit until the worker
+    // reports having seen something.
+    await_worker_listening(&fluree, ledger_id, &handle).await;
+
+    // Untrack: republishes the config, which the worker hears as
+    // GraphSourceConfigPublished and reconciles against the record.
+    fluree.set_bm25_tracked(&gs_id, false).await.unwrap();
+    await_registration(&handle, &gs_id, false).await;
+
+    // And back: re-tracking must re-adopt it without a restart.
+    fluree.set_bm25_tracked(&gs_id, true).await.unwrap();
+    await_registration(&handle, &gs_id, true).await;
+
+    handle.stop();
+    let _ = task.await;
+}
+
+/// Poll the worker's registration set until `want` holds, or fail loudly.
+/// The worker reconciles asynchronously off the event bus, so there is no
+/// synchronous point to assert at.
+async fn await_registration(handle: &fluree_db_api::Bm25WorkerHandle, gs_id: &str, want: bool) {
+    for _ in 0..200 {
+        let registered = handle
+            .registered_graph_sources()
+            .iter()
+            .any(|id| id == gs_id);
+        if registered == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "timed out waiting for {gs_id} to be registered={want}; \
+         registered set is {:?}",
+        handle.registered_graph_sources()
+    );
+}
+
+/// Commit to `ledger_id` until the worker reports having received an event,
+/// which is the only observable proof that `run()` has subscribed.
+async fn await_worker_listening(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    handle: &fluree_db_api::Bm25WorkerHandle,
+) {
+    for i in 0..200 {
+        if handle.stats().events_received > 0 {
+            return;
+        }
+        let ledger = fluree.ledger(ledger_id).await.unwrap();
+        let tx = json!({
+            "@context": { "ex":"http://example.org/" },
+            "@graph": [{ "@id": format!("ex:ping{i}"), "ex:ping": i }]
+        });
+        fluree.insert(ledger, &tx).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("worker never reported receiving an event; it is not subscribed");
+}

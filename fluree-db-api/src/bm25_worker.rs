@@ -339,6 +339,20 @@ impl Bm25WorkerHandle {
     }
 }
 
+/// What one nameservice event asks the worker to do.
+///
+/// The two halves have different costs: `sync` is answered from the in-memory
+/// dependency map, while `reconcile` needs a nameservice read.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Bm25EventAction {
+    /// Indexes whose source ledger advanced — enqueue a debounced sync.
+    pub sync: Vec<String>,
+    /// A BM25 graph source whose config was republished. The event does not
+    /// carry the config, so the record has to be re-read to decide whether
+    /// this is still an index we maintain.
+    pub reconcile: Option<String>,
+}
+
 /// BM25 maintenance worker.
 ///
 /// Monitors nameservice events and automatically syncs BM25 indexes when their
@@ -384,8 +398,11 @@ impl Bm25MaintenanceWorker {
 
     /// Process a single nameservice event.
     ///
-    /// Returns the list of graph source IDs that need syncing.
-    pub fn process_event(&self, event: &NameServiceEvent) -> Vec<String> {
+    /// Returns what the event asks the loop to do. The two halves have
+    /// different costs: `sync` is answered from the in-memory dependency map,
+    /// while `reconcile` needs a nameservice read, so the loop has to do it
+    /// asynchronously.
+    pub fn process_event(&self, event: &NameServiceEvent) -> Bm25EventAction {
         self.state.lock().record_event();
 
         match event {
@@ -403,14 +420,17 @@ impl Bm25MaintenanceWorker {
                         "Ledger commit triggers graph source sync"
                     );
                 }
-                graph_sources
+                Bm25EventAction {
+                    sync: graph_sources,
+                    reconcile: None,
+                }
             }
             NameServiceEvent::LedgerIndexPublished {
                 ledger_id, index_t, ..
             } => {
                 // Index updates don't require graph source sync (commit already triggered it)
                 debug!(ledger = %ledger_id, index_t, "Ledger index published (no graph source sync needed)");
-                vec![]
+                Bm25EventAction::default()
             }
             NameServiceEvent::GraphSourceConfigPublished {
                 graph_source_id,
@@ -422,13 +442,19 @@ impl Bm25MaintenanceWorker {
                 // `sync_bm25_index` against it on every commit to its source
                 // ledger, and every one of those fails. This mirrors the
                 // start-up pass, which already filters on `is_bm25()`.
-                if self.config.auto_register && *source_type == GraphSourceType::Bm25 {
-                    self.state
-                        .lock()
-                        .register_graph_source(graph_source_id, dependencies);
-                    info!(graph_source = %graph_source_id, "Auto-registered graph source for maintenance");
+                //
+                // The event carries no config, so whether this index is
+                // *tracked* needs a nameservice read. Hand it back for the loop
+                // to reconcile, rather than registering something the operator
+                // has opted out of.
+                let reconcile = (self.config.auto_register
+                    && *source_type == GraphSourceType::Bm25)
+                    .then(|| graph_source_id.clone());
+                let _ = dependencies;
+                Bm25EventAction {
+                    sync: vec![],
+                    reconcile,
                 }
-                vec![]
             }
             NameServiceEvent::GraphSourceRetracted { graph_source_id } => {
                 // The event carries no `source_type`, so this fires for every
@@ -438,9 +464,9 @@ impl Bm25MaintenanceWorker {
                 if self.state.lock().unregister_graph_source(graph_source_id) {
                     info!(graph_source = %graph_source_id, "Unregistered retracted graph source");
                 }
-                vec![]
+                Bm25EventAction::default()
             }
-            _ => vec![], // Other events don't trigger sync
+            _ => Bm25EventAction::default(), // Other events don't trigger sync
         }
     }
 
@@ -464,6 +490,57 @@ impl Bm25MaintenanceWorker {
                 self.state.lock().record_sync(false);
                 error!(graph_source = %graph_source_id, error = %e, "Graph source sync failed");
                 Err(e)
+            }
+        }
+    }
+
+    /// Re-read one graph source's record and register or unregister it to
+    /// match. Returns whether it is registered afterwards.
+    ///
+    /// This is how a `tracked` flip, a retraction, or a changed dependency set
+    /// is absorbed: `GraphSourceConfigPublished` says only that *something*
+    /// changed, so the record is the source of truth. Registering straight off
+    /// the event would re-adopt an index the operator has opted out of, on its
+    /// owner's very next config write.
+    async fn reconcile_registration(&self, graph_source_id: &str) {
+        let record = match self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+        {
+            Ok(record) => record,
+            Err(e) => {
+                // Leave the registration as it stands: a failed read is not
+                // evidence the index went away, and dropping it here would
+                // stop maintaining an index over a transient error.
+                warn!(
+                    graph_source = %graph_source_id,
+                    error = %e,
+                    "Failed to re-read BM25 graph source; leaving its registration as is"
+                );
+                return;
+            }
+        };
+
+        let keep = record
+            .as_ref()
+            .is_some_and(|r| r.is_bm25() && !r.retracted && crate::bm25_tracked(r));
+
+        match (keep, record) {
+            (true, Some(record)) => {
+                self.state
+                    .lock()
+                    .register_graph_source(&record.graph_source_id, &record.dependencies);
+                info!(graph_source = %graph_source_id, "Maintaining BM25 index");
+            }
+            _ => {
+                if self.state.lock().unregister_graph_source(graph_source_id) {
+                    info!(
+                        graph_source = %graph_source_id,
+                        "Stopped maintaining BM25 index; it is untracked, retracted or gone"
+                    );
+                }
             }
         }
     }
@@ -575,9 +652,16 @@ impl Bm25MaintenanceWorker {
                 res = subscription.receiver.recv() => {
                     match res {
                         Ok(event) => {
-                            let sources_to_sync = self.process_event(&event);
-                            if !sources_to_sync.is_empty() {
-                                for gs in sources_to_sync {
+                            let action = self.process_event(&event);
+                            // A nameservice read, awaited inline: it is a
+                            // metadata lookup, and doing it here keeps the
+                            // registration change ordered ahead of any commit
+                            // event that follows it on the same bus.
+                            if let Some(graph_source_id) = action.reconcile {
+                                self.reconcile_registration(&graph_source_id).await;
+                            }
+                            if !action.sync.is_empty() {
+                                for gs in action.sync {
                                     pending.insert(gs);
                                 }
                                 next_flush = Some(Instant::now() + Duration::from_millis(self.config.debounce_ms));
@@ -937,12 +1021,13 @@ mod tests {
         }
     }
 
-    /// A vector / R2RML / Iceberg source registered here would be handed to
+    /// A vector / R2RML / Iceberg source reconciled here would be handed to
     /// `sync_bm25_index` on every commit to its source ledger, and every one of
     /// those fails. The start-up pass already filters on `is_bm25()`; this is
-    /// the runtime half of the same rule.
+    /// the runtime half of the same rule, and it fires before the nameservice
+    /// read so a non-BM25 publish costs nothing.
     #[tokio::test]
-    async fn only_bm25_sources_are_auto_registered() {
+    async fn only_bm25_sources_are_reconciled() {
         let worker = worker();
 
         for source_type in [
@@ -952,24 +1037,40 @@ mod tests {
             GraphSourceType::Iceberg,
             GraphSourceType::Unknown("custom".to_string()),
         ] {
-            worker.process_event(&config_published("other:main", source_type.clone()));
-            assert!(
-                worker.handle().registered_graph_sources().is_empty(),
-                "{source_type:?} must not be registered with the BM25 worker"
+            let action = worker.process_event(&config_published("other:main", source_type.clone()));
+            assert_eq!(
+                action,
+                Bm25EventAction::default(),
+                "{source_type:?} must not reach the BM25 worker's reconcile path"
             );
         }
 
-        worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
+        let action = worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
         assert_eq!(
-            worker.handle().registered_graph_sources(),
-            vec!["search:main"],
-            "a BM25 source must still auto-register"
+            action.reconcile.as_deref(),
+            Some("search:main"),
+            "a BM25 source must be reconciled against its record"
+        );
+        assert!(action.sync.is_empty(), "a config publish is not a commit");
+    }
+
+    /// The config event carries no config, so the worker must not conclude
+    /// anything about the index from the event alone — the record decides.
+    #[tokio::test]
+    async fn a_config_publish_does_not_register_on_its_own() {
+        let worker = worker();
+
+        worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
+
+        assert!(
+            worker.handle().registered_graph_sources().is_empty(),
+            "registration must wait for the record to be read"
         );
     }
 
-    /// `auto_register: false` still means no registration, whatever the type.
+    /// `auto_register: false` still means nothing to reconcile, whatever the type.
     #[tokio::test]
-    async fn auto_register_off_registers_nothing() {
+    async fn auto_register_off_reconciles_nothing() {
         let worker = Bm25MaintenanceWorker::with_config(
             Arc::new(crate::fluree_memory()),
             Bm25WorkerConfig {
@@ -978,9 +1079,9 @@ mod tests {
             },
         );
 
-        worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
+        let action = worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
 
-        assert!(worker.handle().registered_graph_sources().is_empty());
+        assert_eq!(action, Bm25EventAction::default());
     }
 
     #[test]
