@@ -154,6 +154,8 @@ pub struct Bm25WorkerState {
     ledger_to_graph_sources: HashMap<String, HashSet<String>>,
     /// Forward map: graph_source_id -> set of ledger_ides (for unregistration).
     gs_to_ledgers: HashMap<String, HashSet<String>>,
+    /// Syncs asked for out of band, drained by the run loop on its next pass.
+    requested: HashSet<String>,
     /// Statistics.
     stats: Bm25WorkerStats,
 }
@@ -164,6 +166,7 @@ impl Bm25WorkerState {
         Self {
             ledger_to_graph_sources: HashMap::new(),
             gs_to_ledgers: HashMap::new(),
+            requested: HashSet::new(),
             stats: Bm25WorkerStats::default(),
         }
     }
@@ -247,6 +250,16 @@ impl Bm25WorkerState {
         self.ledger_to_graph_sources.keys().cloned().collect()
     }
 
+    /// Ask for a sync of `graph_source_id` on the loop's next pass.
+    pub fn request_sync(&mut self, graph_source_id: &str) {
+        self.requested.insert(canonical_alias(graph_source_id));
+    }
+
+    /// Take the out-of-band sync requests accumulated since the last call.
+    pub fn take_requested(&mut self) -> HashSet<String> {
+        std::mem::take(&mut self.requested)
+    }
+
     /// Record a sync operation.
     pub fn record_sync(&mut self, success: bool) {
         self.stats.syncs_performed += 1;
@@ -327,6 +340,15 @@ impl Bm25WorkerHandle {
         self.state.lock().registered_graph_sources()
     }
 
+    /// Ask the worker to sync an index without waiting for a commit.
+    ///
+    /// Queued rather than performed here, so it goes through the same
+    /// concurrency cap and per-index dedup as an event-driven sync — two
+    /// syncs of one index racing would have both publish against the same
+    /// manifest. Takes effect on the loop's next pass.
+    pub fn request_sync(&self, graph_source_id: &str) {
+        self.state.lock().request_sync(graph_source_id);
+    }
     /// Request the worker to stop.
     pub fn stop(&self) {
         self.stop_requested.store(true, Ordering::Relaxed);
@@ -521,6 +543,15 @@ impl Bm25MaintenanceWorker {
                     log_sync_failure(&graph_source_id, res);
                 }
                 break;
+            }
+
+            // Pick up syncs asked for out of band — the start-up catch-up
+            // pass, and anything else that knows an index is behind without
+            // having seen a commit event for it.
+            let requested = self.state.lock().take_requested();
+            if !requested.is_empty() {
+                pending.extend(requested);
+                next_flush = Some(Instant::now());
             }
 
             // Flush pending syncs if debounce timer elapsed and we have capacity.
