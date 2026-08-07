@@ -54,7 +54,7 @@ pub use state::AppState;
 pub use telemetry::{init_logging, shutdown_tracer, TelemetryConfig};
 
 use axum::Router;
-use fluree_db_api::{Bm25MaintenanceWorker, Bm25WorkerHandle, Fluree};
+use fluree_db_api::{bm25_tracked, Bm25MaintenanceWorker, Bm25WorkerHandle, Fluree};
 use fluree_db_nameservice::GraphSourceRecord;
 use std::sync::Arc;
 
@@ -100,10 +100,14 @@ fn bm25_worker_owner(config: &ServerConfig, consensus: Consensus) -> Bm25WorkerO
 ///
 /// Retracted indexes are left out: syncing one is refused, so registering it
 /// would only log a failed sync on every commit to its source ledger.
+///
+/// Untracked indexes are left out too — that is the per-index opt-out from
+/// `--bm25-auto-sync`, for an index whose resync is too expensive to run on
+/// every commit. An index created before the flag existed reads as tracked.
 pub fn indexes_to_auto_sync(records: &[GraphSourceRecord]) -> Vec<&GraphSourceRecord> {
     records
         .iter()
-        .filter(|gs| gs.is_bm25() && !gs.retracted)
+        .filter(|gs| gs.is_bm25() && !gs.retracted && bm25_tracked(gs))
         .collect()
 }
 
@@ -1248,5 +1252,55 @@ mod tests {
         ];
 
         assert!(indexes_to_auto_sync(&records).is_empty());
+    }
+
+    fn untracked(name: &str) -> GraphSourceRecord {
+        GraphSourceRecord::new(
+            name,
+            "main",
+            GraphSourceType::Bm25,
+            r#"{"tracked":false}"#,
+            vec!["docs:main".to_string()],
+        )
+    }
+
+    /// The per-index opt-out: `--bm25-auto-sync` is on for the deployment, but
+    /// this index syncs on its owner's schedule instead.
+    #[test]
+    fn registration_skips_untracked_indexes() {
+        assert!(indexes_to_auto_sync(&[untracked("archive")]).is_empty());
+    }
+
+    /// Opting one index out must not opt out the rest.
+    #[test]
+    fn registration_keeps_tracked_indexes_alongside_untracked_ones() {
+        let records = vec![
+            untracked("archive"),
+            record("search", GraphSourceType::Bm25),
+            GraphSourceRecord::new(
+                "titles",
+                "main",
+                GraphSourceType::Bm25,
+                r#"{"tracked":true}"#,
+                vec!["docs:main".to_string()],
+            ),
+        ];
+
+        let selected: Vec<&str> = indexes_to_auto_sync(&records)
+            .iter()
+            .map(|gs| gs.graph_source_id.as_str())
+            .collect();
+
+        assert_eq!(selected, vec!["search:main", "titles:main"]);
+    }
+
+    /// An index created before the flag existed carries no `tracked` key and
+    /// must keep being maintained — this is what stops the feature from
+    /// silently disabling maintenance on upgrade.
+    #[test]
+    fn registration_keeps_indexes_that_predate_the_tracked_flag() {
+        let records = vec![record("legacy", GraphSourceType::Bm25)];
+
+        assert_eq!(indexes_to_auto_sync(&records).len(), 1);
     }
 }
