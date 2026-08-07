@@ -137,13 +137,38 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
     (worker, handle)
 }
 
+/// Publishes a worker handle where request handlers can find it, and clears
+/// the slot when dropped.
+///
+/// A drop guard rather than a line after the `run()` await, because losing
+/// Raft leadership *aborts* that task: the future is cancelled at its next
+/// await point, so cleanup written after `run()` would never execute and the
+/// slot would go on advertising a worker that has stopped.
+struct PublishedBm25Worker(crate::state::Bm25WorkerSlot);
+
+impl PublishedBm25Worker {
+    fn new(slot: crate::state::Bm25WorkerSlot, handle: Bm25WorkerHandle) -> Self {
+        *slot.lock() = Some(handle);
+        Self(slot)
+    }
+}
+
+impl Drop for PublishedBm25Worker {
+    fn drop(&mut self) {
+        *self.0.lock() = None;
+    }
+}
+
 /// Drive a BM25 maintenance worker to completion, logging an unexpected exit.
 ///
 /// Used by the Raft leader watcher, whose task-spawning closure is synchronous
 /// and so cannot do the registration pass itself.
 #[cfg(feature = "raft")]
-async fn run_bm25_worker(fluree: Arc<Fluree>) {
-    let (worker, _handle) = build_bm25_worker(fluree).await;
+async fn run_bm25_worker(slot: crate::state::Bm25WorkerSlot, fluree: Arc<Fluree>) {
+    let (worker, handle) = build_bm25_worker(fluree).await;
+    // Held for the life of the worker; dropping it — including on the abort
+    // that follows a demotion — stops this node claiming to maintain anything.
+    let _published = PublishedBm25Worker::new(slot, handle);
     if let Err(e) = worker.run().await {
         tracing::error!(error = %e, "BM25 maintenance worker exited");
     }
@@ -434,7 +459,13 @@ impl FlureeServer {
             }
             Bm25WorkerOwner::ThisServer => {
                 let (worker, handle) = build_bm25_worker(Arc::clone(&self.state.fluree)).await;
+                // Publish before spawning, so there is no window in which the
+                // router is up and reports no worker. The guard moves into the
+                // task and clears the slot however that task ends.
+                let published =
+                    PublishedBm25Worker::new(self.state.bm25_worker_slot(), handle.clone());
                 let task = tokio::spawn(async move {
+                    let _published = published;
                     if let Err(e) = worker.run().await {
                         tracing::error!(error = %e, "BM25 maintenance worker exited");
                     }
@@ -968,6 +999,7 @@ impl FlureeServerBuilder {
             let backend = state_inner.fluree.backend().clone();
             let bm25_auto_sync = state_inner.config.bm25_auto_sync;
             let bm25_fluree = Arc::clone(&state_inner.fluree);
+            let bm25_slot = state_inner.bm25_worker_slot();
             let indexer_config = fluree_db_indexer::IndexerConfig::default();
             let event_bus = Arc::clone(&integration.event_bus);
             let eviction_scheduler =
@@ -1007,7 +1039,10 @@ impl FlureeServerBuilder {
                 // demotion: an ex-leader's publish proposal no longer carries,
                 // so finishing the sync would only delay the handover.
                 if bm25_auto_sync {
-                    tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
+                    tasks.push(tokio::spawn(run_bm25_worker(
+                        bm25_slot.clone(),
+                        Arc::clone(&bm25_fluree),
+                    )));
                 }
                 tasks
             };
@@ -1302,5 +1337,45 @@ mod tests {
         let records = vec![record("legacy", GraphSourceType::Bm25)];
 
         assert_eq!(indexes_to_auto_sync(&records).len(), 1);
+    }
+
+    /// The slot must not outlive the worker. Losing Raft leadership aborts the
+    /// task rather than stopping it, so this is a `Drop` guard and not a line
+    /// after the await — a cancelled future never reaches that line, and the
+    /// node would go on reporting a worker that had stopped.
+    #[tokio::test]
+    async fn dropping_the_published_worker_clears_the_slot() {
+        let fluree = Arc::new(fluree_db_api::fluree_memory());
+        let worker = Bm25MaintenanceWorker::new(fluree);
+        let slot = crate::state::Bm25WorkerSlot::default();
+
+        let published = PublishedBm25Worker::new(Arc::clone(&slot), worker.handle());
+        assert!(slot.lock().is_some(), "publishing fills the slot");
+
+        drop(published);
+        assert!(slot.lock().is_none(), "dropping the guard empties it");
+    }
+
+    /// The abort case specifically: a task cancelled mid-run still clears.
+    #[tokio::test]
+    async fn aborting_the_worker_task_clears_the_slot() {
+        let fluree = Arc::new(fluree_db_api::fluree_memory());
+        let worker = Bm25MaintenanceWorker::new(fluree);
+        let slot = crate::state::Bm25WorkerSlot::default();
+        let published = PublishedBm25Worker::new(Arc::clone(&slot), worker.handle());
+
+        let task = tokio::spawn(async move {
+            let _published = published;
+            worker.run().await
+        });
+        // Let the worker reach its first await point before cancelling.
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            slot.lock().is_none(),
+            "an aborted worker must not leave the node claiming to maintain indexes"
+        );
     }
 }
