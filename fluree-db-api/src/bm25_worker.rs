@@ -274,7 +274,10 @@ impl Default for Bm25WorkerState {
 
 /// Handle to interact with a running BM25 maintenance worker.
 ///
-/// This handle allows registering/unregistering graph sources and stopping the worker.
+/// This handle allows registering/unregistering graph sources and stopping the
+/// worker. Cheap to clone — all of its state is behind an `Arc` — so the
+/// spawner can keep one for shutdown and hand another to request handlers.
+#[derive(Clone)]
 pub struct Bm25WorkerHandle {
     state: Arc<Mutex<Bm25WorkerState>>,
     /// Signal to stop the worker (set to true to request stop).
@@ -325,6 +328,11 @@ impl Bm25WorkerHandle {
     /// Get all registered graph sources.
     pub fn registered_graph_sources(&self) -> Vec<String> {
         self.state.lock().registered_graph_sources()
+    }
+
+    /// Get all ledgers whose commits currently trigger a sync.
+    pub fn watched_ledgers(&self) -> Vec<String> {
+        self.state.lock().watched_ledgers()
     }
 
     /// Request the worker to stop.
