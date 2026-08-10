@@ -131,6 +131,7 @@ async fn a_tracked_job_survives_a_restart() {
             source: SOURCE.to_string(),
             target: TARGET.to_string(),
             poll_interval_secs: 300,
+            filter: None,
         })
         .await
         .expect("persist");
@@ -171,6 +172,7 @@ async fn an_untracked_job_is_not_restored() {
             source: SOURCE.to_string(),
             target: TARGET.to_string(),
             poll_interval_secs: 300,
+            filter: None,
         })
         .await
         .expect("persist");
@@ -217,6 +219,7 @@ async fn re_tracking_replaces_rather_than_duplicates() {
                 source: SOURCE.to_string(),
                 target: TARGET.to_string(),
                 poll_interval_secs: interval,
+                filter: None,
             })
             .await
             .expect("persist");
