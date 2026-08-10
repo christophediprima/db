@@ -625,6 +625,13 @@ pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Resp
                 "source": j.source,
                 "target": j.target,
                 "poll_interval_secs": j.poll_interval_secs,
+                // The row filter this job runs under, so an operator can confirm
+                // which slice this server owns without reading the state ledger.
+                // Absent means unfiltered.
+                "filter": j.filter.as_ref().map(|f| serde_json::json!({
+                    "column": f.column,
+                    "values": f.keep.iter().collect::<Vec<_>>(),
+                })),
             })
         })
         .collect();
