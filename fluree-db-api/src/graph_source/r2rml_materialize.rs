@@ -129,7 +129,16 @@ pub struct PersistedMaterializeJob {
     pub target: String,
     /// This job's own poll cadence.
     pub poll_interval_secs: u64,
+    /// Restricts which source rows this job materializes. Absent takes every row.
+    ///
+    /// `skip_serializing_if` keeps a filterless job's blob byte-identical to one
+    /// written before this field existed, and `default` lets those older blobs
+    /// deserialize — the record is an opaque serde blob, so both directions have to
+    /// hold for a rolling upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SourceFilter>,
 }
+
 /// Byte budgets the materialize pass would otherwise derive for itself.
 ///
 /// Production passes [`Default`] and gets the derived values; only tests set these.
@@ -185,6 +194,72 @@ pub struct MaterializeResult {
     pub tally: TargetTally,
 }
 
+/// Restricts which source rows a materialization pass takes.
+///
+/// A tracking job may name a column and the set of values it cares about; a row whose
+/// value in that column is outside the set is not materialized. This is a property of the
+/// JOB, not of the process — it is persisted with the job and travels with it.
+///
+/// # What it is for
+///
+/// Materializing a subset of a shared source table. The obvious uses are excluding test
+/// or inactive tenants, and backfilling one partition at a time. It also composes with a
+/// templated target to give a way to **shard** the materializer across several Fluree
+/// instances: writes are single-leader per ledger, so more write capacity means disjoint
+/// ledger sets on separate instances, and a job whose target is
+/// `silver_{tenant_id}_{user_id}:main` fans out into one ledger per user. Give each
+/// instance the same jobs with a DISJOINT filter value set and each one materializes only
+/// its own slice, with no shard concept anywhere in this code. Nothing here knows about
+/// sharding; it just filters rows.
+///
+/// # Why this is enforced here, not only in the Iceberg scan
+///
+/// The scan can take an `Expression` and `arrow_reader` does exact row filtering, so
+/// pushing the predicate down looks sufficient. It is not, for a filter anyone relies on:
+///
+/// * `collect_and_comparisons` builds an exact row filter only from `Comparison` and
+///   `And`. `In` — the form this filter takes — is deliberately transparent, and that
+///   code's own comment states the row filter "may only ever keep MORE rows than the true
+///   predicate", with file and row-group pruning staying the authority. A lone `In`
+///   therefore yields NO row filter, and any file holding a mix of values delivers all of
+///   them.
+/// * The whole pushdown is gated by `FLUREE_ICEBERG_PREDICATE_PUSHDOWN`, so one
+///   environment variable could otherwise turn a filter off silently.
+///
+/// So the filter is applied per row here, where rows are consumed, and pushed into the
+/// scan separately as an optimisation — file and row-group pruning, where `In` IS
+/// supported and sound. Same configuration drives both; each is used where it is valid.
+///
+/// # Why the column value, and not the resolved target name
+///
+/// With a templated target, matching a prefix of the expansion (`silver_acme_`) looks
+/// equivalent and has a trap: a value containing the template separator (`acme_eu`)
+/// expands to `silver_acme_eu_u1`, which prefix-matches `acme`. For a filter separating
+/// tenants, leakage from a string coincidence is the worst failure available, so the
+/// decision is made on the column's exact value before any expansion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceFilter {
+    /// Source column to test (e.g. `tenant_id`).
+    pub column: String,
+    /// The values to keep. A row whose value is absent is skipped.
+    pub keep: std::collections::BTreeSet<String>,
+}
+
+impl SourceFilter {
+    /// Whether `row` passes the filter.
+    ///
+    /// A row missing the column, or holding NULL there, does NOT pass. It cannot be
+    /// attributed to any value, so no filter value can claim it — and for the sharding
+    /// use above, guessing would mean either two instances both claiming it (duplicate
+    /// writes) or neither (silent loss). Skipping is the only answer that is identical
+    /// on every instance.
+    pub fn keeps_row(&self, batch: &ColumnBatch, row: usize) -> bool {
+        match column_string(batch, &self.column, row) {
+            Some(value) => self.keep.contains(value.as_str()),
+            None => false,
+        }
+    }
+}
 /// The source side of a materialize pass: what the mapping is, how to interpret it, and
 /// one window of rows.
 ///
@@ -301,6 +376,7 @@ impl Fluree {
         source_graph_source_id: &str,
         target_ledger_id: &str,
         force_full: bool,
+        filter: Option<&SourceFilter>,
     ) -> Result<MaterializeResult> {
         let provider = FlureeR2rmlProvider::new(self);
         self.materialize_from_source(
@@ -310,6 +386,7 @@ impl Fluree {
             force_full,
             // Production always derives its own transaction and memory budgets.
             MaterializeBudgets::default(),
+            filter,
         )
         .await
     }
@@ -331,6 +408,7 @@ impl Fluree {
         target_ledger_id: &str,
         force_full: bool,
         budgets: MaterializeBudgets,
+        filter: Option<&SourceFilter>,
     ) -> Result<MaterializeResult> {
         // 1. Compiled R2RML mapping (subject / predicate / object maps) and the
         //    materialization options (delete convention + latest-by-key ordering).
@@ -389,6 +467,7 @@ impl Fluree {
             .unwrap_or_else(materialize_memory_budget_bytes);
         let mut accum = MaterializeAccum::default();
         let mut rows_read = 0usize;
+        let mut rows_filtered = 0usize;
         let mut incremental_all = true;
         let mut any_table = false;
         // Set when at least one table's window has aged past the refresh bound, so a
@@ -481,6 +560,15 @@ impl Fluree {
                 }
                 for row in 0..batch.num_rows {
                     rows_read += 1;
+                    // The job's row filter, applied before template expansion on the
+                    // column's exact value — see `SourceFilter` for why not a prefix of
+                    // the expanded target, and why not the Iceberg scan filter alone.
+                    if let Some(filter) = filter {
+                        if !filter.keeps_row(batch, row) {
+                            rows_filtered += 1;
+                            continue;
+                        }
+                    }
                     // Resolve this row's TARGET ledger. A placeholder-free target
                     // is used verbatim for every row (plain single-target job); a
                     // templated target (e.g. `silver_{tenant_id}_{user_id}:main`)
@@ -691,11 +779,26 @@ impl Fluree {
             deferred: deferred.len(),
             failed: failed.len(),
         };
+        // A filtered job reports what it skipped on EVERY pass, not only a partial
+        // one. This is the number that distinguishes "the filter is working" from
+        // "the filter matches nothing" and from "the filter matches everything" —
+        // all three otherwise look like a healthy job, and two of them are wrong.
+        if let Some(filter) = filter {
+            info!(
+                source = %source_graph_source_id,
+                column = %filter.column,
+                keep = filter.keep.len(),
+                rows_read,
+                rows_filtered,
+                "materialize: source filter applied"
+            );
+        }
         if !tally.is_complete() {
             info!(
                 targets_ok = tally.ok,
                 targets_deferred = tally.deferred,
                 targets_failed = tally.failed,
+                rows_filtered,
                 "materialize: partial window"
             );
         }
@@ -855,6 +958,7 @@ impl Fluree {
             source: source.to_string(),
             target: target.to_string(),
             poll_interval_secs: 0,
+            filter: None,
         };
         self.upsert(state, &job_node(&job, false)?).await?;
         info!(source, target, "Untracked materialization job");
@@ -3044,6 +3148,7 @@ mod engine_tests {
                 "people_native:main",
                 false,
                 MaterializeBudgets::default(),
+                None,
             )
             .await
             .expect("materialize");
@@ -3092,6 +3197,7 @@ mod engine_tests {
                 "people_native:main",
                 false,
                 MaterializeBudgets::default(),
+                None,
             )
             .await
             .expect("materialize");
@@ -3125,6 +3231,7 @@ mod engine_tests {
                     "people_native:main",
                     false,
                     MaterializeBudgets::default(),
+                    None,
                 )
                 .await
                 .expect("materialize");
@@ -3162,6 +3269,7 @@ mod engine_tests {
                 "people_{tenant}:main",
                 false,
                 MaterializeBudgets::default(),
+                None,
             )
             .await
             .expect("materialize");
@@ -3221,6 +3329,7 @@ mod engine_tests {
                         txn_bytes: budget,
                         ..Default::default()
                     },
+                    None,
                 )
                 .await
                 .expect("materialize");
@@ -3283,6 +3392,7 @@ mod engine_tests {
                 "people_native:main",
                 false,
                 MaterializeBudgets::default(),
+                None,
             )
             .await
             .expect("materialize");
@@ -3335,6 +3445,7 @@ mod engine_tests {
                     accum_bytes: Some(200),
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect_err("40 subjects cannot fit a 200-byte accumulator budget");
@@ -3376,6 +3487,7 @@ mod engine_tests {
                 "people_native:main",
                 false,
                 MaterializeBudgets::default(),
+                None,
             )
             .await
             .expect("materialize");
@@ -3423,6 +3535,7 @@ mod engine_tests {
                 "people_{tenant}:main",
                 false,
                 MaterializeBudgets::default(),
+                None,
             )
             .await
             .expect("materialize");
@@ -3440,5 +3553,263 @@ mod engine_tests {
             result.subjects_upserted, 1,
             "the unroutable row is dropped, not misfiled"
         );
+    }
+
+    /// The point of the filter: a job materializes ONLY the rows it keeps.
+    ///
+    /// Without it a job reads every row and calls `create_ledger` for every
+    /// target, so N shards each build all N tenants' ledgers — the worker destroys the
+    /// disjointness that sharding exists to create.
+    /// The filter has to survive a restart, or a sharded deployment silently
+    /// widens to every row the first time a node bounces. The job record is an
+    /// opaque serde blob, so this pins both directions of the round trip.
+    #[test]
+    fn a_job_filter_survives_the_persisted_blob() {
+        let job = PersistedMaterializeJob {
+            source: "silverarticle:main".to_string(),
+            target: "silver_{tenant_id}_{user_id}:main".to_string(),
+            poll_interval_secs: 30,
+            filter: Some(SourceFilter {
+                column: "tenant_id".to_string(),
+                keep: ["acme".to_string(), "globex".to_string()]
+                    .into_iter()
+                    .collect(),
+            }),
+        };
+
+        let blob = serde_json::to_string(&job).expect("serialize");
+        let back: PersistedMaterializeJob = serde_json::from_str(&blob).expect("deserialize");
+
+        assert_eq!(back, job);
+    }
+
+    /// A blob written before the field existed must still load, and must load as
+    /// "no filter" rather than failing the whole restore — one unparseable job
+    /// would otherwise take every other job's restore down with it.
+    #[test]
+    fn a_job_blob_without_a_filter_still_loads() {
+        let older = r#"{"source":"s:main","target":"t:main","poll_interval_secs":30}"#;
+
+        let job: PersistedMaterializeJob = serde_json::from_str(older).expect("deserialize");
+
+        assert_eq!(job.filter, None, "absent means every row, as before");
+    }
+
+    /// And a filterless job must not start writing a `filter` key, so a rolling
+    /// upgrade does not rewrite every job blob it touches.
+    #[test]
+    fn a_filterless_job_serializes_as_it_did_before() {
+        let job = PersistedMaterializeJob {
+            source: "s:main".to_string(),
+            target: "t:main".to_string(),
+            poll_interval_secs: 30,
+            filter: None,
+        };
+
+        let blob = serde_json::to_string(&job).expect("serialize");
+
+        assert!(!blob.contains("filter"), "unexpected key in {blob}");
+    }
+
+    #[tokio::test]
+    async fn a_filtered_job_materializes_only_the_kept_values() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2", "3"]),
+                ("name", &["alice", "bob", "carol"]),
+                ("tenant", &["acme", "globex", "acme"]),
+            ])],
+        );
+        let filter = SourceFilter {
+            column: "tenant".into(),
+            keep: ["acme".to_string()].into_iter().collect(),
+        };
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                MaterializeBudgets::default(),
+                Some(&filter),
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.tally,
+            TargetTally {
+                ok: 1,
+                deferred: 0,
+                failed: 0
+            },
+            "only acme's ledger may be touched — a globex ledger here means this shard \
+             created another shard's target"
+        );
+        assert_eq!(
+            result.subjects_upserted, 2,
+            "acme's two rows, not globex's one"
+        );
+        assert_eq!(
+            result.rows_read, 3,
+            "all three rows are still READ; ownership is a filter"
+        );
+    }
+
+    /// A row whose shard key is NULL belongs to NO shard.
+    ///
+    /// The shard key here is `region`, deliberately NOT a template column. My first
+    /// version of this test used the template column itself and was VACUOUS: a NULL
+    /// template column already fails `resolve_target_ledger`, so the row was skipped
+    /// downstream whatever ownership decided, and mutating `None => true` left it green.
+    /// Mutation testing caught that. When the shard key is independent of the template the
+    /// row IS routable, so this branch is the only thing that can skip it.
+    ///
+    /// Skipping is the only sound answer: claiming it in every shard duplicates writes,
+    /// and claiming it in the "first" shard is order-dependent. Both alternatives differ
+    /// per shard, which is precisely what sharding must not do.
+    #[tokio::test]
+    async fn a_row_with_a_null_filter_column_is_not_materialized() {
+        let fields = vec![
+            FieldInfo {
+                name: "id".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "tenant".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+            FieldInfo {
+                name: "region".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 4,
+            },
+        ];
+        let cols = vec![
+            Column::String(vec![Some("1".into()), Some("2".into())]),
+            Column::String(vec![Some("alice".into()), Some("bob".into())]),
+            // BOTH rows route fine — tenant is never null — so only ownership can skip one.
+            Column::String(vec![Some("acme".into()), Some("acme".into())]),
+            Column::String(vec![Some("eu".into()), None]),
+        ];
+        let b = ColumnBatch::new(Arc::new(BatchSchema::new(fields)), cols).expect("batch");
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(people_mapping(), vec![b]);
+        let filter = SourceFilter {
+            column: "region".into(),
+            keep: ["eu".to_string()].into_iter().collect(),
+        };
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                MaterializeBudgets::default(),
+                Some(&filter),
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.subjects_upserted, 1,
+            "the region=eu row is owned; the region=NULL row is routable but unattributable \
+             and must be skipped rather than claimed"
+        );
+        assert_eq!(
+            result.rows_read, 2,
+            "both rows were read — ownership is a filter, not a scan"
+        );
+    }
+
+    /// An unknown shard key is skipped too — a key this process does not own is not this
+    /// process's work, whether it belongs to a sibling shard or to no shard at all.
+    #[tokio::test]
+    async fn a_row_outside_the_keep_set_is_skipped() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2"]),
+                ("name", &["alice", "bob"]),
+                ("tenant", &["acme", "acme"]),
+                ("region", &["eu", "us"]),
+            ])],
+        );
+        let filter = SourceFilter {
+            column: "region".into(),
+            keep: ["eu".to_string()].into_iter().collect(),
+        };
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                MaterializeBudgets::default(),
+                Some(&filter),
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.subjects_upserted, 1,
+            "region=us belongs to another shard and must not be written here"
+        );
+    }
+
+    /// Unsharded (`None`) must behave exactly as before sharding existed. This is the
+    /// regression guard for every existing single-instance deployment.
+    #[tokio::test]
+    async fn no_filter_materializes_every_row() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2"]),
+                ("name", &["alice", "bob"]),
+                ("tenant", &["acme", "globex"]),
+            ])],
+        );
+
+        let result = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                MaterializeBudgets::default(),
+                None,
+            )
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.tally,
+            TargetTally {
+                ok: 2,
+                deferred: 0,
+                failed: 0
+            },
+            "unsharded means both tenants are this process's work"
+        );
+        assert_eq!(result.subjects_upserted, 2);
     }
 }

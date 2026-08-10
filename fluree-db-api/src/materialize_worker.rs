@@ -112,6 +112,8 @@ impl MaterializeWorkerStats {
 struct TrackedJob {
     source: String,
     target: String,
+    /// Restricts which source rows this job materializes. `None` takes every row.
+    filter: Option<crate::graph_source::SourceFilter>,
     /// How often this job is polled.
     interval: Duration,
     /// When this job is next due for a poll.
@@ -125,6 +127,8 @@ pub struct JobInfo {
     pub target: String,
     /// This job's poll interval, in seconds.
     pub poll_interval_secs: u64,
+    /// The row filter this job materializes under, if any.
+    pub filter: Option<crate::graph_source::SourceFilter>,
 }
 
 type JobKey = (String, String);
@@ -146,7 +150,13 @@ impl MaterializeWorkerHandle {
     /// own poll cadence; `None` uses the worker's configured default. Returns the
     /// effective interval. The next poll fires one interval from now (the caller
     /// typically runs an immediate first sync itself).
-    pub fn track(&self, source: &str, target: &str, interval: Option<Duration>) -> Duration {
+    pub fn track(
+        &self,
+        source: &str,
+        target: &str,
+        interval: Option<Duration>,
+        filter: Option<crate::graph_source::SourceFilter>,
+    ) -> Duration {
         let interval = interval.unwrap_or(self.default_interval);
         let key = (source.to_string(), target.to_string());
         let mut tracked = self.tracked.lock().expect("materialize worker mutex");
@@ -155,6 +165,7 @@ impl MaterializeWorkerHandle {
             TrackedJob {
                 source: source.to_string(),
                 target: target.to_string(),
+                filter,
                 interval,
                 next_due: Instant::now() + interval,
             },
@@ -213,6 +224,7 @@ impl MaterializeWorkerHandle {
                 source: j.source.clone(),
                 target: j.target.clone(),
                 poll_interval_secs: j.interval.as_secs(),
+                filter: j.filter.clone(),
             })
             .collect()
     }
@@ -309,6 +321,7 @@ impl MaterializeTrackingWorker {
                 &job.source,
                 &job.target,
                 Some(Duration::from_secs(job.poll_interval_secs)),
+                job.filter.clone(),
             );
         }
         if !jobs.is_empty() {
@@ -361,7 +374,7 @@ impl MaterializeTrackingWorker {
         self.bump(|s| s.polls += 1);
         match self
             .fluree
-            .materialize_r2rml_graph_source(&job.source, &job.target, false)
+            .materialize_r2rml_graph_source(&job.source, &job.target, false, job.filter.as_ref())
             .await
         {
             Ok(result) if result.committed => {
@@ -506,12 +519,12 @@ mod tests {
     fn track_uses_explicit_interval_else_default() {
         let h = MaterializeWorkerHandle::for_test(Duration::from_secs(30));
         assert_eq!(
-            h.track("s:main", "t:main", Some(Duration::from_secs(300))),
+            h.track("s:main", "t:main", Some(Duration::from_secs(300)), None),
             Duration::from_secs(300),
             "explicit interval is used and returned"
         );
         assert_eq!(
-            h.track("s2:main", "t:main", None),
+            h.track("s2:main", "t:main", None, None),
             Duration::from_secs(30),
             "None falls back to the worker default"
         );
@@ -537,7 +550,7 @@ mod tests {
     #[test]
     fn take_due_jobs_respects_next_due_and_reschedules() {
         let h = MaterializeWorkerHandle::for_test(Duration::from_secs(1));
-        h.track("s:main", "t:main", Some(Duration::from_secs(3600)));
+        h.track("s:main", "t:main", Some(Duration::from_secs(3600)), None);
         assert!(
             h.take_due_jobs().is_empty(),
             "a just-tracked job is not due until now + interval"

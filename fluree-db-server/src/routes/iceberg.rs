@@ -218,6 +218,11 @@ pub struct IcebergMaterializeRequest {
     /// (full only on the first run or a non-incremental-safe window).
     #[serde(default)]
     pub force_full: bool,
+    /// Restrict which source rows this pass materializes. Omit to take every row.
+    /// Same shape as `POST /iceberg/track`'s `filter`, so a manual one-shot on a
+    /// deployment that shards by filter can be scoped the same way its job is.
+    #[serde(default)]
+    pub filter: Option<SourceFilterRequest>,
 }
 
 /// Response for `POST /v1/fluree/iceberg/materialize`
@@ -285,7 +290,12 @@ async fn iceberg_materialize_local(
 
         let result = state
             .fluree
-            .materialize_r2rml_graph_source(&req.source, &req.target, req.force_full)
+            .materialize_r2rml_graph_source(
+                &req.source,
+                &req.target,
+                req.force_full,
+                parse_source_filter(req.filter.as_ref())?.as_ref(),
+            )
             .await
             .map_err(ServerError::Api)?;
 
@@ -343,6 +353,47 @@ pub struct IcebergTrackRequest {
     /// response (tests, one-off manual runs on a small source).
     #[serde(default)]
     pub wait_for_first_sync: bool,
+    /// Restrict which source rows this job materializes: a column and the values
+    /// to keep. Omit to materialize every row.
+    ///
+    /// Combined with a templated `target`, this is how one source table is split
+    /// across several Fluree instances — give each the same job with a disjoint
+    /// value set. Rows whose value in `column` is NULL or absent are not
+    /// materialized by any of them.
+    #[serde(default)]
+    pub filter: Option<SourceFilterRequest>,
+}
+
+/// The `filter` block of `POST /v1/fluree/iceberg/track` and `.../materialize`.
+#[derive(Deserialize, Clone)]
+pub struct SourceFilterRequest {
+    /// Source column to test (e.g. `tenant_id`).
+    pub column: String,
+    /// The values to keep.
+    pub values: Vec<String>,
+}
+
+/// Validate and convert a request `filter` block.
+///
+/// Both failure modes are refused rather than normalised, because both look like a
+/// healthy job that simply has no matching rows yet: an empty column name would
+/// filter on nothing, and an empty value set would materialize nothing at all.
+fn parse_source_filter(
+    filter: Option<&SourceFilterRequest>,
+) -> Result<Option<fluree_db_api::SourceFilter>> {
+    match filter {
+        None => Ok(None),
+        Some(f) if f.column.trim().is_empty() => {
+            Err(ServerError::bad_request("filter.column must not be empty"))
+        }
+        Some(f) if f.values.is_empty() => Err(ServerError::bad_request(
+            "filter.values must not be empty; omit `filter` to materialize every row",
+        )),
+        Some(f) => Ok(Some(fluree_db_api::SourceFilter {
+            column: f.column.trim().to_string(),
+            keep: f.values.iter().cloned().collect(),
+        })),
+    }
 }
 
 /// Response for `POST /v1/fluree/iceberg/track`.
@@ -407,10 +458,13 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
         )
     })?;
 
+    let filter = parse_source_filter(req.filter.as_ref())?;
+
     let interval = worker.track(
         &req.source,
         &req.target,
         req.poll_interval_secs.map(std::time::Duration::from_secs),
+        filter.clone(),
     );
 
     // Persist the job so a restart restores it instead of silently stopping
@@ -423,6 +477,7 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
             source: req.source.clone(),
             target: req.target.clone(),
             poll_interval_secs: interval.as_secs(),
+            filter: filter.clone(),
         })
         .await
         .map_err(ServerError::Api)?;
@@ -443,7 +498,7 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
     let (first_sync, initial, first_sync_error) = if req.wait_for_first_sync {
         match state
             .fluree
-            .materialize_r2rml_graph_source(&req.source, &req.target, false)
+            .materialize_r2rml_graph_source(&req.source, &req.target, false, filter.as_ref())
             .await
         {
             Ok(result) => (

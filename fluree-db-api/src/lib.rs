@@ -209,9 +209,9 @@ pub use graph_source::{
     GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig,
     IcebergCreateResult, MaterializeResult, PartitionFieldInfo, PersistedMaterializeJob,
     R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode, SnapshotRef,
-    SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StructuredR2rmlMapping,
-    SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
-    ValidateR2rmlResponse,
+    SortFieldInfo, SourceFilter, StatsCompleteness, StatsTier, StorageAccessReport,
+    StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride, TablePreview,
+    TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
