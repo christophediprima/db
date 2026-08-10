@@ -420,6 +420,64 @@ are separate ledgers (isolated by the per-ledger read gate) rather than named
 graphs. Within each per-partition ledger, `rr:graphMap` named-graph routing still
 applies independently.
 
+### Materializing a subset of the source (row filter)
+
+A job may restrict which source rows it materializes, by naming a column and the
+values to keep:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/iceberg/track \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "source": "orders:main",
+        "target": "orders_{tenant_id}_{user_id}:main",
+        "filter": { "column": "tenant_id", "values": ["acme", "globex"] } }'
+```
+
+Rows whose value in that column falls outside the set are not materialized. A row
+whose filter column is **null or absent does not pass** — it cannot be attributed
+to any value, so nothing claims it.
+
+The filter belongs to the **job**, not to the process: it is persisted with the
+job and restored on restart. `POST /iceberg/materialize` accepts the same block,
+so a manual one-shot can be scoped the way its job is. `filter.values` must be
+non-empty — an empty set would materialize nothing while looking exactly like a
+healthy job that has no matching rows yet, so it is refused.
+
+Each pass logs `rows_filtered` alongside `rows_read`, which is what distinguishes
+a working filter from one matching nothing and one matching everything.
+
+The filter is applied **per row, as rows are consumed**. It is also pushed into
+the Iceberg scan as an `IN` predicate, but only as an optimisation — for file and
+row-group pruning, where `IN` is fully supported. It is deliberately not relied on
+there for correctness: the exact Arrow row filter is built only from `Comparison`
+and `And`, so a lone `IN` yields no row filter and any file holding a mix of
+values delivers all of them; and predicate pushdown is switchable via
+`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`, which must not be able to widen a filter.
+
+#### Using a filter and a templated target to split the work across servers
+
+Writes are single-leader per ledger, so write throughput scales by giving separate
+servers **disjoint sets of ledgers**. A templated target already produces one
+ledger per partition; a filter decides which partitions a given server owns. Run
+the same jobs on each server with a disjoint `filter.values`:
+
+```
+server A:  "filter": { "column": "tenant_id", "values": ["acme", "globex"] }
+server B:  "filter": { "column": "tenant_id", "values": ["initech"] }
+```
+
+Each server then materializes only its own tenants' ledgers, and nothing in the
+materializer knows about this arrangement — it is two ordinary jobs with different
+filters.
+
+Two properties are worth knowing before relying on it. Every server must run
+**all** the jobs, because any source table can contain rows for any partition, so
+the source read is repeated per server (the `IN` pushdown prunes files, which
+recovers most of that when the table is laid out by the filter column, and little
+when it is not). And a query dataset can only combine ledgers on **one** server,
+so partitions that need to be queried together must be assigned together.
+
 ### Multiple sources into one target (additive)
 
 By default materialization is **additive**: it inserts and updates triples and
@@ -551,7 +609,9 @@ target. The materializer enforces what it can and documents the rest:
 - **A templated target creates ledgers without bound** — one per distinct
   partition value that appears in the source. Malformed or high-cardinality
   partition columns create that many ledgers; the template columns are the
-  operator's responsibility to keep bounded and well-formed.
+  operator's responsibility to keep bounded and well-formed. A row filter on the
+  same column bounds it explicitly (see [Materializing a subset of the
+  source](#materializing-a-subset-of-the-source-row-filter)).
 
 ## Partition Pruning
 
