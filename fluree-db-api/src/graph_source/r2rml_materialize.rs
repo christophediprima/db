@@ -130,6 +130,28 @@ pub struct PersistedMaterializeJob {
     /// This job's own poll cadence.
     pub poll_interval_secs: u64,
 }
+/// Byte budgets the materialize pass would otherwise derive for itself.
+///
+/// Production passes [`Default`] and gets the derived values; only tests set these.
+/// They exist because the shipped defaults are unreachable in a unit test: the
+/// per-transaction budget has a **1 MiB floor** (`.max(1 << 20)`), so proving that a
+/// window splits across transactions would need >1 MiB of JSON-LD — ~24,000 rows, minutes
+/// through the transact path — and the accumulator budget defaults to 1 GiB, so proving
+/// its gate fires would need a gigabyte-scale window. A parameter only tests supply is a
+/// smell; a multi-minute test nobody runs is a worse one, and an env var would be
+/// process-global and flaky under parallel tests.
+///
+/// Grouped into one type rather than carried as loose `Option<usize>` parameters so that
+/// adding a genuine production parameter does not push `materialize_from_source` past
+/// clippy's argument limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MaterializeBudgets {
+    /// Per-transaction byte budget. `None` derives it from `reindex_max_bytes`.
+    pub txn_bytes: Option<usize>,
+    /// Accumulator memory budget. `None` derives it from
+    /// [`materialize_memory_budget_bytes`].
+    pub accum_bytes: Option<usize>,
+}
 
 /// Outcome of one materialization pass.
 #[derive(Debug, Clone)]
@@ -287,8 +309,7 @@ impl Fluree {
             target_ledger_id,
             force_full,
             // Production always derives its own transaction and memory budgets.
-            None,
-            None,
+            MaterializeBudgets::default(),
         )
         .await
     }
@@ -300,26 +321,16 @@ impl Fluree {
     /// simply supplies the production source, so nothing about the server's behaviour
     /// moves — see `MaterializeSource` for what a fake does and does not cover.
     ///
-    /// `txn_budget_override` overrides the per-transaction byte budget. Production passes
-    /// `None` and gets the derived value; only a test passes `Some`. It exists because the
-    /// derived budget has a **1 MiB floor** (`.max(1 << 20)`), so proving that a window is
-    /// split across transactions would otherwise need >1 MiB of JSON-LD — ~24,000 rows,
-    /// which took minutes through the transact path. A parameter only tests supply is a
-    /// smell; a multi-minute unit test nobody runs is a worse one, and an env var would be
-    /// process-global and flaky under parallel tests.
-    ///
-    /// `accum_budget_override` overrides the accumulator memory budget
-    /// ([`materialize_memory_budget_bytes`]) for the same reason: the shipped
-    /// default is 1 GiB, so proving the gate fires would otherwise need a
-    /// gigabyte-scale test window.
+    /// `budgets` overrides the byte budgets this method would otherwise derive.
+    /// Production passes `MaterializeBudgets::default()`; see that type for why the
+    /// overrides exist at all.
     pub(crate) async fn materialize_from_source(
         &self,
         provider: &dyn MaterializeSource,
         source_graph_source_id: &str,
         target_ledger_id: &str,
         force_full: bool,
-        txn_budget_override: Option<usize>,
-        accum_budget_override: Option<usize>,
+        budgets: MaterializeBudgets,
     ) -> Result<MaterializeResult> {
         // 1. Compiled R2RML mapping (subject / predicate / object maps) and the
         //    materialization options (delete convention + latest-by-key ordering).
@@ -373,7 +384,9 @@ impl Fluree {
         let parents = ParentIndexSet::new(&mapping)
             .map_err(|e| ApiError::Config(format!("invalid R2RML mapping: {e}")))?;
         let mut emit_stats = MaterializeStats::default();
-        let accum_budget = accum_budget_override.unwrap_or_else(materialize_memory_budget_bytes);
+        let accum_budget = budgets
+            .accum_bytes
+            .unwrap_or_else(materialize_memory_budget_bytes);
         let mut accum = MaterializeAccum::default();
         let mut rows_read = 0usize;
         let mut incremental_all = true;
@@ -626,8 +639,9 @@ impl Fluree {
         // letting it accumulate toward the ceiling. A node without a local indexer
         // has no such drain, which is why the tracking worker only runs where
         // indexing is enabled (`fluree-db-server/src/state.rs`).
-        let txn_budget =
-            txn_budget_override.unwrap_or((self.index_config.reindex_max_bytes / 4).max(1 << 20));
+        let txn_budget = budgets
+            .txn_bytes
+            .unwrap_or((self.index_config.reindex_max_bytes / 4).max(1 << 20));
 
         // PER-TARGET ISOLATION.
         //
@@ -3024,7 +3038,13 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_native:main",
+                false,
+                MaterializeBudgets::default(),
+            )
             .await
             .expect("materialize");
 
@@ -3066,7 +3086,13 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_native:main",
+                false,
+                MaterializeBudgets::default(),
+            )
             .await
             .expect("materialize");
 
@@ -3098,8 +3124,7 @@ mod engine_tests {
                     "people:main",
                     "people_native:main",
                     false,
-                    None,
-                    None,
+                    MaterializeBudgets::default(),
                 )
                 .await
                 .expect("materialize");
@@ -3136,8 +3161,7 @@ mod engine_tests {
                 "people:main",
                 "people_{tenant}:main",
                 false,
-                None,
-                None,
+                MaterializeBudgets::default(),
             )
             .await
             .expect("materialize");
@@ -3193,8 +3217,10 @@ mod engine_tests {
                     "people:main",
                     "people_native:main",
                     false,
-                    budget,
-                    None,
+                    MaterializeBudgets {
+                        txn_bytes: budget,
+                        ..Default::default()
+                    },
                 )
                 .await
                 .expect("materialize");
@@ -3251,7 +3277,13 @@ mod engine_tests {
             ])],
         );
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_native:main",
+                false,
+                MaterializeBudgets::default(),
+            )
             .await
             .expect("materialize");
         assert_eq!(result.subjects_upserted, 1);
@@ -3299,8 +3331,10 @@ mod engine_tests {
                 "people:main",
                 "people_native:main",
                 false,
-                None,
-                Some(200),
+                MaterializeBudgets {
+                    accum_bytes: Some(200),
+                    ..Default::default()
+                },
             )
             .await
             .expect_err("40 subjects cannot fit a 200-byte accumulator budget");
@@ -3336,7 +3370,13 @@ mod engine_tests {
         let fluree = FlureeBuilder::memory().build_memory();
         let src = FakeSource::new(people_mapping(), vec![batch(&rows)]);
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_native:main",
+                false,
+                MaterializeBudgets::default(),
+            )
             .await
             .expect("materialize");
         assert_eq!(result.subjects_upserted, 40);
@@ -3382,8 +3422,7 @@ mod engine_tests {
                 "people:main",
                 "people_{tenant}:main",
                 false,
-                None,
-                None,
+                MaterializeBudgets::default(),
             )
             .await
             .expect("materialize");
