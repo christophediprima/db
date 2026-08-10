@@ -60,6 +60,13 @@ impl<'a> FlakeEvalParams<'a> {
 ///
 /// Holds the policy wrapper, grounded identity, and class cache.
 /// Designed to be shareable across concurrent query executions.
+///
+/// Runtime class-membership cache, keyed by `(graph, subject)`.
+///
+/// Named so the field's type stays legible now that the key is a pair — the
+/// inline form trips clippy's `type_complexity` at exactly this nesting depth.
+type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, Sid), Vec<Sid>>>>;
+
 #[derive(Debug, Clone)]
 pub struct PolicyContext {
     /// The policy wrapper containing view and modify policy sets
@@ -72,7 +79,7 @@ pub struct PolicyContext {
     /// different `rdf:type` values in different named graphs, and an `f:onClass`
     /// decision made against another graph's classes is simply wrong. Keying on
     /// `Sid` alone made the result depend on which graph populated the entry first.
-    class_cache: Arc<RwLock<std::collections::HashMap<(GraphId, Sid), Vec<Sid>>>>,
+    class_cache: ClassCache,
 }
 
 impl PolicyContext {

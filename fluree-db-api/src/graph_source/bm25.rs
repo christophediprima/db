@@ -1724,7 +1724,10 @@ mod scope_tests {
         // The caller treats "nothing affected" as a full resync; binding an empty
         // values list would instead silently index nothing.
         assert!(scope_indexing_query_to_subjects(&doc_query(), &iris(&[])).is_none());
+    }
+}
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
