@@ -728,9 +728,15 @@ impl Fluree {
         // letting it accumulate toward the ceiling. A node without a local indexer
         // has no such drain, which is why the tracking worker only runs where
         // indexing is enabled (`fluree-db-server/src/state.rs`).
-        let txn_budget = budgets
-            .txn_bytes
-            .unwrap_or((self.index_config.reindex_max_bytes / 4).max(1 << 20));
+        //
+        // A deployment may pin this budget independently of the ceiling — see
+        // `materialize_txn_budget_override` for why that separation is needed. Unset,
+        // the derivation below is exactly what it always was.
+        let txn_budget = resolve_txn_budget(
+            budgets.txn_bytes,
+            materialize_txn_budget_override(),
+            self.index_config.reindex_max_bytes,
+        );
 
         // PER-TARGET ISOLATION.
         //
@@ -1687,6 +1693,75 @@ fn materialize_memory_budget_bytes() -> usize {
     })
 }
 
+/// Deployment override for the per-transaction chunk budget, in MiB, from
+/// `FLUREE_MATERIALIZE_TXN_BUDGET_MB`. `None` (unset, or a non-positive value)
+/// keeps the derived `reindex_max_bytes / 4`.
+///
+/// WHY THIS EXISTS AT ALL, given the derivation above is well argued: those are one
+/// variable today, and they pull in opposite directions.
+///
+/// `reindex_max_bytes` is *also* the per-ledger novelty ceiling
+/// (`at_max_novelty`, fluree-db-ledger/src/lib.rs:507). A target whose window
+/// needs more than the ceiling can only ever be materialized by raising it,
+/// because `NoveltyAtMax` DEFERS — deliberately, to avoid a documented indexer
+/// deadlock — and a deferral discards the window's progress, so the next poll
+/// re-reads the same rows and stops at the same wall. Nothing accumulates.
+///
+/// Measured, in production: one target of 421,708 items (~45 MB of flakes at this
+/// table's measured ~108 flake-bytes/row) against an 8 MiB ceiling deferred on
+/// **22 consecutive polls over 1 h 23 m with an identical remainder each time**,
+/// and the job's watermark was never written once in 13.7 h. Meanwhile the 19
+/// targets that did fit were re-committed every poll, costing 6-13 GiB/h of disk
+/// for no forward progress.
+///
+/// Raising the ceiling fixes that — but it quadruples this budget, and a large
+/// chunk is what a single 14-minute staging stall was observed at (one call in
+/// 693, on an 819,482-row window), which is why the ceiling was cut 64 -> 8 MiB
+/// in the first place. That cut was explicitly a mitigation on an unproven
+/// hypothesis, and it traded a rare stall for a permanent livelock.
+///
+/// Separating them lets a deployment raise the ceiling for headroom while holding
+/// the chunk size its data is known to stage cleanly. Neither number has to be
+/// wrong for the other to be right.
+fn materialize_txn_budget_override() -> Option<usize> {
+    static CACHED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_txn_budget_mb(
+            std::env::var("FLUREE_MATERIALIZE_TXN_BUDGET_MB")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Parsing split out from [`materialize_txn_budget_override`] so it is testable: that
+/// function caches in a `OnceLock` and reads process-global state, so a test could
+/// neither set it twice nor run in parallel with another that did.
+///
+/// A zero or unparseable value yields `None` — i.e. fall back to the derivation —
+/// rather than a zero budget, which would chunk one item per transaction.
+fn parse_txn_budget_mb(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// Which of the three sources of a per-transaction budget wins.
+///
+/// Order is deliberate: an explicit `MaterializeBudgets` value is a test driving a
+/// specific shape and must win; the deployment override is next; the derivation from
+/// the novelty ceiling is the default. Split out as a pure function so the precedence
+/// is pinned by tests rather than inferred from a chain of combinators.
+fn resolve_txn_budget(
+    explicit: Option<usize>,
+    deployment_override: Option<usize>,
+    reindex_max_bytes: usize,
+) -> usize {
+    explicit
+        .or(deployment_override)
+        .unwrap_or((reindex_max_bytes / 4).max(1 << 20))
+}
+
 fn watermark_refresh_bound_ms() -> i64 {
     static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -2582,6 +2657,61 @@ mod tests {
         let (live, del) = a.finalize();
         assert!(live.contains_key(&dk("urn:a")));
         assert!(!del.contains(&dk("urn:a")));
+    }
+
+    /// The whole point of the override is that a deployment can raise the novelty
+    /// ceiling for headroom WITHOUT the chunk size following it, so this pins that the
+    /// two numbers are genuinely independent now.
+    #[test]
+    fn a_pinned_txn_budget_does_not_follow_the_novelty_ceiling() {
+        let pinned = Some(2 * 1024 * 1024);
+        for ceiling in [8 * 1024 * 1024, 64 * 1024 * 1024, 256 * 1024 * 1024] {
+            assert_eq!(
+                resolve_txn_budget(None, pinned, ceiling),
+                2 * 1024 * 1024,
+                "ceiling {ceiling} must not move a pinned budget"
+            );
+        }
+    }
+
+    /// Unset, every existing deployment must chunk exactly as it did before this knob
+    /// existed — including the 1 MiB floor that keeps a tiny ceiling from producing
+    /// single-item transactions.
+    #[test]
+    fn without_an_override_the_budget_is_still_a_quarter_of_the_ceiling() {
+        assert_eq!(
+            resolve_txn_budget(None, None, 8 * 1024 * 1024),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            resolve_txn_budget(None, None, 64 * 1024 * 1024),
+            16 * 1024 * 1024
+        );
+        // Floor: a quarter of 1 MiB would be 256 KiB.
+        assert_eq!(resolve_txn_budget(None, None, 1024 * 1024), 1024 * 1024);
+    }
+
+    /// An explicit `MaterializeBudgets` value is a test driving a specific chunk shape;
+    /// a deployment override must not silently retune those tests.
+    #[test]
+    fn an_explicit_budget_outranks_the_deployment_override() {
+        assert_eq!(
+            resolve_txn_budget(Some(4096), Some(2 * 1024 * 1024), 0),
+            4096
+        );
+    }
+
+    /// `0` and junk mean "fall back", never "a zero-byte budget" — that would chunk one
+    /// item per transaction and turn a misconfiguration into a throughput collapse
+    /// rather than a startup error.
+    #[test]
+    fn a_zero_or_unparseable_txn_budget_falls_back_rather_than_chunking_by_one() {
+        assert_eq!(parse_txn_budget_mb(Some("0")), None);
+        assert_eq!(parse_txn_budget_mb(Some("")), None);
+        assert_eq!(parse_txn_budget_mb(Some("banana")), None);
+        assert_eq!(parse_txn_budget_mb(Some("-4")), None);
+        assert_eq!(parse_txn_budget_mb(None), None);
+        assert_eq!(parse_txn_budget_mb(Some(" 2 ")), Some(2 * 1024 * 1024));
     }
 
     #[test]
