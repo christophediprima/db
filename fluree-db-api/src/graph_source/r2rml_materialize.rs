@@ -3761,7 +3761,7 @@ mod engine_tests {
                 "people:main",
                 "people_{tenant}:main",
                 false,
-                None,
+                MaterializeBudgets::default(),
                 None,
             )
             .await
@@ -3784,7 +3784,7 @@ mod engine_tests {
                 "people:main",
                 "people_{tenant}:main",
                 false,
-                None,
+                MaterializeBudgets::default(),
                 None,
             )
             .await
