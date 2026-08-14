@@ -513,7 +513,10 @@ async fn build_direct_fluree(
                 config.gc_max_old_indexes,
                 config.gc_min_time_mins,
                 config.gc_hard_max_old_indexes,
-            );
+            )
+            .with_indexer_catchup_interval(std::time::Duration::from_secs(
+                config.indexer_catchup_interval_secs,
+            ));
     } else {
         // Peer / external-indexer mode: skip spawning a background
         // indexer, but still set novelty thresholds so backpressure

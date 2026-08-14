@@ -449,6 +449,16 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_GC_HARD_MAX_OLD_INDEXES")]
     pub gc_hard_max_old_indexes: Option<u32>,
 
+    /// How often to re-sweep for ledgers whose indexing has stalled (seconds)
+    ///
+    /// A safety net for a ledger that falls behind and then stops receiving the
+    /// commits that would trigger it. Only ledgers that are behind AND whose
+    /// commit_t has not moved since the previous sweep are queued, so a healthy
+    /// deployment pays one nameservice listing per interval and nothing else.
+    /// `0` disables the re-sweep; the sweep performed at start-up always runs.
+    #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS)]
+    pub indexer_catchup_interval_secs: u64,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -856,6 +866,8 @@ impl Default for ServerConfig {
             gc_max_old_indexes: None,
             gc_min_time_mins: None,
             gc_hard_max_old_indexes: None,
+
+            indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             cache_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
