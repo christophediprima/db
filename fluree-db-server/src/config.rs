@@ -755,6 +755,31 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_BOLT_DEFAULT_DB")]
     pub bolt_default_db: Option<String>,
 
+    // === Index storage sweep ===
+    /// Minutes between automatic orphan sweeps. Unset disables them entirely,
+    /// which is today's behaviour: the sweep then only runs when an operator
+    /// calls `/v1/fluree/sweep`.
+    ///
+    /// The sweep reclaims index artifacts that no live index chain references.
+    /// `clean_garbage` cannot: it releases what a root's garbage manifest NAMES,
+    /// and deliberately defers an absent manifest here. Nothing ran that
+    /// deferral automatically, so it accumulated — measured at 80,994 artifacts
+    /// and 57.25 GiB (46 % of a volume) on a four-ledger deployment, dominated
+    /// by shared dictionary blobs rather than index history. No retention
+    /// setting could have reclaimed any of it: `gc-max-old-indexes` bounds the
+    /// REACHABLE chain, and none of these were on it.
+    #[arg(long, env = "FLUREE_GC_ORPHAN_SWEEP_INTERVAL_MINS")]
+    pub gc_orphan_sweep_interval_mins: Option<u64>,
+
+    /// Let the automatic sweep DELETE, rather than only report what it would.
+    ///
+    /// Off by default, and deliberately a second switch rather than implied by
+    /// the interval: the failure mode of a wrong sweep is silent data loss, not
+    /// wasted space, so a deployment should read one reporting pass before
+    /// handing it deletion. Ignored unless the interval is also set.
+    #[arg(long, env = "FLUREE_GC_ORPHAN_DELETE")]
+    pub gc_orphan_delete: bool,
+
     // === MCP (Model Context Protocol) options ===
     /// Enable MCP (Model Context Protocol) endpoint at /mcp
     #[arg(long, env = "FLUREE_MCP_ENABLED")]
@@ -852,6 +877,9 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            // Sweep disabled by default: unset interval is today's behaviour.
+            gc_orphan_sweep_interval_mins: None,
+            gc_orphan_delete: false,
             config_file: None,
             profile: None,
             listen_addr: server_defaults::DEFAULT_LISTEN_ADDR.parse().unwrap(),
