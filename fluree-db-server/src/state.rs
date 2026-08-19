@@ -111,6 +111,8 @@ pub struct AppState {
     /// Join handle for the materialization worker task; aborted on drop.
     #[cfg(feature = "iceberg")]
     materialize_worker_task: Option<tokio::task::JoinHandle<()>>,
+    /// Periodic orphan sweep, when `gc_orphan_sweep_interval_mins` is set.
+    orphan_sweep_task: Option<tokio::task::JoinHandle<()>>,
 
     /// Registry of in-flight negotiated-upload import jobs (reference impl of
     /// the presigned `.flpack` upload flow). Empty/unused unless
@@ -304,6 +306,24 @@ impl AppState {
                 (None, None)
             };
 
+        // Gated to the node that INDEXES, and for the same reason the sweep is
+        // documented as single-process only: its hold excludes local index
+        // builds, not an external indexer's. A peer sweeping a ledger another
+        // process is building could classify that build's fresh artifacts as
+        // orphans, which is the one mistake here that destroys data rather than
+        // wasting space.
+        let orphan_sweep_task = match config.gc_orphan_sweep_interval_mins {
+            Some(mins) if config.indexing_enabled && config.server_role != ServerRole::Peer => {
+                let worker = fluree_db_api::OrphanSweepWorker::new(
+                    Arc::clone(&fluree),
+                    mins,
+                    config.gc_orphan_delete,
+                );
+                Some(tokio::spawn(worker.run()))
+            }
+            _ => None,
+        };
+
         Ok(Self {
             fluree,
             config,
@@ -326,6 +346,7 @@ impl AppState {
             materialize_worker,
             #[cfg(feature = "iceberg")]
             materialize_worker_task,
+            orphan_sweep_task,
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
             #[cfg(feature = "aws")]
             storage_vend_scope,
@@ -394,6 +415,9 @@ impl Drop for AppState {
         }
         #[cfg(feature = "iceberg")]
         if let Some(task) = self.materialize_worker_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.orphan_sweep_task.take() {
             task.abort();
         }
     }

@@ -78,6 +78,7 @@ mod merge_preview;
 pub mod nameservice_query;
 pub(crate) mod ns_helpers;
 pub mod ontology_imports;
+pub mod orphan_sweep_worker;
 mod overlay;
 pub mod pack;
 pub mod policy_builder;
@@ -235,11 +236,12 @@ pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
 
-#[cfg(feature = "iceberg")]
 pub use materialize_worker::{
     MaterializeTrackingWorker, MaterializeWorkerConfig, MaterializeWorkerHandle,
     MaterializeWorkerStats,
 };
+#[cfg(feature = "iceberg")]
+pub use orphan_sweep_worker::OrphanSweepWorker;
 
 #[cfg(feature = "vector")]
 pub use vector_worker::{
